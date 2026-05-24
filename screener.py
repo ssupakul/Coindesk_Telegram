@@ -120,7 +120,7 @@ def scan_market():
         
         if current_price > ema_200:
             signal_type = ""
-            if current_price > (ema_50 * 0.98) and rsi <= 32:
+            if current_price > (ema_50 * 0.98) and rsi <= 35:
                 signal_type = "RSI Oversold + Pullback 📉"
             elif is_divergence:
                 signal_type = "Bullish Divergence 📈"
@@ -143,7 +143,7 @@ def scan_market():
                     "sl": f"${stop_loss}"
                 })
         
-        if rsi >= 70:
+        if rsi >= 65:
             tp_range_min = format_price(coin, current_price * 1.00)
             tp_range_max = format_price(coin, current_price * 1.05)
             
