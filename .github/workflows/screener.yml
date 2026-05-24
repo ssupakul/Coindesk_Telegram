@@ -1,4 +1,4 @@
-Name: Coindesk to Telegram Crypto Screener
+name: Coindesk to Telegram Crypto Screener
 
 on:
   schedule:
