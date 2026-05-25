@@ -3,7 +3,7 @@ name: Coindesk to Telegram Crypto Screener
 on:
   schedule:
     # รันทุก 1 ชั่วโมง ที่นาทีที่ 30 ของทุกชั่วโมง (เช่น 00:30, 01:30, 02:30 UTC)
-    - cron: '30 * * * *'
+    - cron: '42 * * * *'
   workflow_dispatch: # เปิดให้สามารถกดรันเทสเองแบบ Manual ได้
 
 jobs:
