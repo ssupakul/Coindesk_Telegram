@@ -1,10 +1,11 @@
 name: Coindesk to Telegram Crypto Screener
 
 on:
-  schedule:
-    # รันทุก 1 ชั่วโมง ที่นาทีที่ 30 ของทุกชั่วโมง (เช่น 00:30, 01:30, 02:30 UTC)
-    - cron: '42 * * * *'
-  workflow_dispatch: # เปิดให้สามารถกดรันเทสเองแบบ Manual ได้
+  # รับแรงสะกิดผ่าน API จากบริการภายนอก
+  repository_dispatch:
+    types: [trigger-screener]
+    
+  workflow_dispatch: # ยังเก็บไว้เผื่อกดรันเองแบบ Manual ได้
 
 jobs:
   run-screener:
@@ -22,7 +23,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas numpy
+        with:
+          pip install requests pandas numpy
 
     - name: Run Crypto Screener Script
       env:
@@ -30,4 +32,3 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python screener.py
-      
