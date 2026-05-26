@@ -158,7 +158,7 @@ def scan_market():
             bearish_coins += 1
         
         # สัญญาณเตือนขาย (Overbought เช็คได้ทั้งขาขึ้นและขาลง)
-        if rsi >= 65:
+        if rsi >= 70:
             tp_range_min = format_price(coin, current_price * 1.00)
             tp_range_max = format_price(coin, current_price * 1.05)
             
@@ -183,7 +183,7 @@ def scan_market():
         summary_msg = f"📊 <b>[Market Trend Summary]</b>\n"
         summary_msg += f"📈 ขาขึ้น: {bullish_coins} เหรียญ | 📉 ขาลง: {bearish_coins} เหรียญ\n"
         
-        if bullish_ratio >= 65:
+        if bullish_ratio >= 70:
             summary_msg += f"🔥 ภาพรวม: <b>🟢 ขาขึ้นชัดเจน (Strong Bullish)</b>\n<i>กลยุทธ์: เน้นดักซื้อเมื่อเกิดการย่อตัว (Buy on Dip)</i>"
         elif bullish_ratio >= 40:
             summary_msg += f"🔥 ภาพรวม: <b>🟡 ไซด์เวย์ / เลือกทาง (Sideways)</b>\n<i>กลยุทธ์: ตลาดก้ำกึ่ง ควรเลือกเทรดเฉพาะตัวที่มีสัญญาณชัดเจน</i>"
