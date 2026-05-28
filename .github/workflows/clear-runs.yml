@@ -1,18 +1,19 @@
 name: Clear Old Workflow Runs
 
 on:
-  workflow_dispatch: # เปิดให้คุณสามารถกดสั่งรันแบบแมนนวลผ่านหน้าเว็บได้ตลอดเวลา
+  workflow_dispatch: 
 
 jobs:
   clear-runs:
     runs-on: ubuntu-latest
     permissions:
-      actions: write # สำคัญมาก: เพื่อให้สิทธิ์ Workflow นี้ในการลบประวัติรันอื่นๆ
+      actions: write 
 
     steps:
       - name: Delete all workflow runs
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # ใช้ Token อัตโนมัติที่ GitHub มีให้
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }} # บรรทัดนี้จะระบุชื่อ Repo ปัจจุบันให้อัตโนมัติ
         run: |
           # ดึงรายการรันล่าสุด 100 รายการ และสั่งลบทีละรายการ
           gh run list --limit 100 --json databaseId --jq '.[].databaseId' | while read -r run_id; do
