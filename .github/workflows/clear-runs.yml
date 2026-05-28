@@ -13,10 +13,16 @@ jobs:
       - name: Delete all workflow runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }} # บรรทัดนี้จะระบุชื่อ Repo ปัจจุบันให้อัตโนมัติ
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }} # ดึง ID ของรันปัจจุบันเก็บไว้
         run: |
-          # ดึงรายการรันล่าสุด 100 รายการ และสั่งลบทีละรายการ
           gh run list --limit 100 --json databaseId --jq '.[].databaseId' | while read -r run_id; do
+            # ตรวจสอบว่าถ้า ID ตรงกับรันปัจจุบัน ให้ข้ามไป ไม่ต้องลบตัวเอง
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              echo "Skipping current run ID: $run_id"
+              continue
+            fi
+            
             echo "Deleting run ID: $run_id"
             gh run delete "$run_id"
           done
