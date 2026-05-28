@@ -127,10 +127,14 @@ def scan_market():
         total_valid_coins += 1
         is_divergence = check_bullish_divergence(df)
         
+        # มัดจำค่า RSI ปัดทศนิยมไว้แสดงผล
+        rsi_rounded = round(rsi, 2)
+        
         if current_price > ema_200:
             coin_trend = "🟢 ขาขึ้น (Above EMA 200)"
             bullish_coins += 1
-            coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น")
+            # ปรับปรุง: เพิ่มการแสดงผล RSI ต่อท้ายชื่อเหรียญในส่วนสรุปภาพรวม
+            coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น (RSI: {rsi_rounded})")
             
             signal_type = ""
             if current_price > (ema_50 * 0.98) and rsi <= 35:
@@ -148,7 +152,7 @@ def scan_market():
                     "coin": coin, 
                     "trend": coin_trend,
                     "price": format_price(coin, current_price), 
-                    "rsi": round(rsi, 2),
+                    "rsi": rsi_rounded,
                     "type": signal_type, 
                     "ema_50": format_price(coin, ema_50), 
                     "ema_200": format_price(coin, ema_200), 
@@ -159,7 +163,8 @@ def scan_market():
         else:
             coin_trend = "🔴 ขาลง (Below EMA 200)"
             bearish_coins += 1
-            coin_trends_summary.append(f"• {coin}: 🔴 ขาลง")
+            # ปรับปรุง: เพิ่มการแสดงผล RSI ต่อท้ายชื่อเหรียญในส่วนสรุปภาพรวมเช่นกัน
+            coin_trends_summary.append(f"• {coin}: 🔴 ขาลง (RSI: {rsi_rounded})")
         
         if rsi >= 65:
             tp_range_min = format_price(coin, current_price * 1.00)
@@ -172,7 +177,7 @@ def scan_market():
                 "coin": coin, 
                 "trend": coin_trend,
                 "price": format_price(coin, current_price), 
-                "rsi": round(rsi, 2),
+                "rsi": rsi_rounded,
                 "ema_50": format_price(coin, ema_50), 
                 "ema_200": format_price(coin, ema_200),
                 "tp_zone": f"${tp_range_min} - ${tp_range_max}", 
@@ -200,7 +205,7 @@ def scan_market():
     return buy_signals, sell_signals, summary_msg
 
 if __name__ == "__main__":
-    print("Starting Comprehensive Screener (Always send header)...")
+    print("Starting Comprehensive Screener (With RSI in Summary)...")
     buy_list, sell_list, market_summary = scan_market()
     
     # สร้างข้อความพื้นฐาน (ส่วนหัว) ที่จะส่งเสมอ
