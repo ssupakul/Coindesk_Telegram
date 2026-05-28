@@ -26,7 +26,7 @@ def send_telegram_message(text_msg):
     try:
         response = requests.post(url, json=payload)
         if response.status_code == 200:
-            print("Signal sent via Telegram Bot Successfully.")
+            print("Comprehensive Daily Report sent via Telegram Bot Successfully.")
         else:
             print(f"Failed to send Telegram message: {response.text}")
     except Exception as e:
@@ -128,7 +128,6 @@ def scan_market():
         is_divergence = check_bullish_divergence(df)
         rsi_rounded = round(rsi, 2)
         
-        # ปรับปรุง: ตั้งตัวแปรกลางสำหรับเช็คสัญญาณซื้อ
         signal_type = ""
         
         if current_price > ema_200:
@@ -136,7 +135,6 @@ def scan_market():
             bullish_coins += 1
             coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น (RSI: {rsi_rounded})")
             
-            # สัญญาณซื้อสำหรับขาขึ้น: เน้นย่อตัวบนแนวโน้มหลัก (Pullback) หรือ Divergence
             if current_price > (ema_50 * 0.98) and rsi <= 35:
                 signal_type = "RSI Oversold + Pullback 📉"
             elif is_divergence:
@@ -146,18 +144,15 @@ def scan_market():
             bearish_coins += 1
             coin_trends_summary.append(f"• {coin}: 🔴 ขาลง (RSI: {rsi_rounded})")
             
-            # ปรับปรุง: เพิ่มเงื่อนไขให้แจ้งเตือนฝั่งขาลงด้วย (เน้นเล่นเด้ง Oversold หรือ Divergence ขาลง)
             if rsi <= 35:
                 signal_type = "RSI Oversold (ขาลง-เสี่ยงสูง) 📉"
             elif is_divergence:
                 signal_type = "Bullish Divergence (สวนเทรนด์) 📈"
                 
-        # ถ้ามีสัญญาณซื้อ (ไม่ว่าจะเกิดในขาขึ้นหรือขาลง) ให้บันทึกข้อมูล
         if signal_type:
             entry_min = format_price(coin, current_price * 0.97)
             entry_max = format_price(coin, current_price * 1.00)
             target_profit = format_price(coin, current_price * 1.12) 
-            # ถ้าเป็นขาลง ให้ใช้ราคาปัจจุบันคูณ 0.93 เป็น SL แทน เพราะไม่มีเส้น EMA 200 รับด้านล่าง
             stop_loss_val = ema_200 * 0.98 if current_price > ema_200 else current_price * 0.93
             stop_loss = format_price(coin, stop_loss_val)           
             
@@ -174,7 +169,6 @@ def scan_market():
                 "sl": f"${stop_loss}"
             })
         
-        # สัญญาณเตือนขาย (Overbought เช็คได้ทั้งสองฝั่งเหมือนเดิม)
         if rsi >= 65:
             tp_range_min = format_price(coin, current_price * 1.00)
             tp_range_max = format_price(coin, current_price * 1.05)
@@ -212,47 +206,51 @@ def scan_market():
     return buy_signals, sell_signals, summary_msg
 
 if __name__ == "__main__":
-    print("Starting Comprehensive Screener (With RSI in Summary)...")
+    print("Starting Comprehensive Screener (Single report template)...")
     buy_list, sell_list, market_summary = scan_market()
     
-    # สร้างข้อความพื้นฐาน (ส่วนหัว) ที่จะส่งเสมอ
-    base_message = f"{market_summary}\n"
-    base_message += "\n=========================\n"
+    # เริ่มสร้างข้อความหลักโดยใส่ข้อมูลสรุปภาพรวมและเทรนด์เหรียญ (ส่งแน่ๆ เป็นส่วนหัว)
+    final_message = f"{market_summary}\n"
     
-    # 1. จัดการข้อความฝั่งสัญญาณซื้อ
-    message_buy = base_message + "🎯 <b>[Coindesk Crypto Screener 4H - สัญญาณช้อนซื้อ]</b>"
-    if buy_list:
-        for opt in buy_list:
-            message_buy += f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
-            message_buy += f"\n📊 เทรนด์: {opt['trend']}"
-            message_buy += f"\n🚨 รูปแบบ: {opt['type']}"
-            message_buy += f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
-            message_buy += f"\n📉 RSI (4H): {opt['rsi']}"
-            message_buy += f"\n📈 เส้น EMA 50 / 200: ${opt['ema_50']} / ${opt['ema_200']}"
-            message_buy += f"\n🟢 ช่วงเข้าซื้อ: <code>{opt['entry']}</code>"
-            message_buy += f"\n🔴 เป้าหมายขาย (TP): <code>{opt['tp']}</code>"
-            message_buy += f"\n❌ จุดตัดขาดทุน (SL): <code>{opt['sl']}</code>"
+    # ตรวจสอบว่ามีสัญญาณซื้อหรือสัญญาณเตือนขายหรือไม่
+    if buy_list or sell_list:
+        final_message += "\n=========================\n"
+        
+        # ใส่รายละเอียดสัญญาณซื้อ (ถ้ามี)
+        if buy_list:
+            final_message += "🎯 <b>[Coindesk Crypto Screener 4H - สัญญาณช้อนซื้อ]</b>"
+            for opt in buy_list:
+                final_message += f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
+                final_message += f"\n📊 เทรนด์: {opt['trend']}"
+                final_message += f"\n🚨 รูปแบบ: {opt['type']}"
+                final_message += f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
+                final_message += f"\n📉 RSI (4H): {opt['rsi']}"
+                final_message += f"\n📈 เส้น EMA 50 / 200: ${opt['ema_50']} / ${opt['ema_200']}"
+                final_message += f"\n🟢 ช่วงเข้าซื้อ: <code>{opt['entry']}</code>"
+                final_message += f"\n🔴 เป้าหมายขาย (TP): <code>{opt['tp']}</code>"
+                final_message += f"\n❌ จุดตัดขาดทุน (SL): <code>{opt['sl']}</code>"
+            
+            # คั่นระหว่างสัญญาณซื้อและสัญญาณขายเพื่อความสวยงาม (กรณีเกิดพร้อมกัน)
+            if sell_list:
+                final_message += "\n\n=========================\n"
+
+        # ใส่รายละเอียดสัญญาณขาย Overbought (ถ้ามี)
+        if sell_list:
+            final_message += "⚠️ <b>[Coindesk Crypto Screener 4H - เตือนโซน Overbought]</b>"
+            final_message += "\n<i>คำแนะนำ: ราคาวิ่งแรงเกินไป ควรพิจารณาแบ่งขายทำกำไร</i>"
+            for opt in sell_list:
+                final_message += f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
+                final_message += f"\n📊 เทรนด์: {opt['trend']}"
+                final_message += f"\n🔥 Status: RSI Overbought (ซื้อมากเกินไป)"
+                final_message += f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
+                final_message += f"\n📈 RSI (4H): {opt['rsi']} 🚨"
+                final_message += f"\n📈 เส้น EMA 50 / 200: ${opt['ema_50']} / ${opt['ema_200']}"
+                final_message += f"\n🔴 ช่วงราคาที่ควรทยอยขาย: <code>{opt['tp_zone']}</code>"
+                final_message += f"\n❌ จุดล็อกกำไรหลุดตรงนี้ต้องหนี (Exit): <code>{opt['exit']}</code>"
     else:
-        message_buy += "\n\n😴 <i>ไม่มีสัญญาณซื้อที่เข้าเงื่อนไขในรอบนี้</i>"
-        
-    # ส่งข้อความฝั่งซื้อเสมอ
-    send_telegram_message(message_buy)
-        
-    # 2. จัดการข้อความฝั่งเตือนขาย (Overbought)
-    message_sell = base_message + "⚠️ <b>[Coindesk Crypto Screener 4H - เตือนโซน Overbought]</b>"
-    if sell_list:
-        message_sell += "\n<i>คำแนะนำ: ราคาวิ่งแรงเกินไป ควรพิจารณาแบ่งขายทำกำไร</i>"
-        for opt in sell_list:
-            message_sell += f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
-            message_sell += f"\n📊 เทรนด์: {opt['trend']}"
-            message_sell += f"\n🔥 สถานะ: RSI Overbought (ซื้อมากเกินไป)"
-            message_sell += f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
-            message_sell += f"\n📈 RSI (4H): {opt['rsi']} 🚨"
-            message_sell += f"\n📈 เส้น EMA 50 / 200: ${opt['ema_50']} / ${opt['ema_200']}"
-            message_sell += f"\n🔴 ช่วงราคาที่ควรทยอยขาย: <code>{opt['tp_zone']}</code>"
-            message_sell += f"\n❌ จุดล็อกกำไรหลุดตรงนี้ต้องหนี (Exit): <code>{opt['exit']}</code>"
-    else:
-        message_sell += "\n\n😴 <i>ไม่มีเหรียญที่เข้าโซน Overbought ในรอบนี้</i>"
-        
-    # ส่งข้อความฝั่งเตือนขายเสมอ
-    send_telegram_message(message_sell)
+        # กรณีไม่มีสัญญาณใดๆ เลย จะต่อท้ายสั้นๆ เพื่อแจ้งว่าไม่มีสัญญาณ
+        final_message += "\n\n=========================\n"
+        final_message += "😴 <i>ตลาดนิ่งสนิท: ไม่มีสัญญาณซื้อ/ขายที่เข้าเงื่อนไขในรอบนี้</i>"
+
+    # ส่งข้อความมัดรวมเสร็จสมบูรณ์ในข้อความเดียวจบ!
+    send_telegram_message(final_message)
