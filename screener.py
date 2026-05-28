@@ -92,8 +92,11 @@ def check_bullish_divergence(df, lookback=15):
     return False
 
 def format_price(coin, price):
-    if price < 0.001:
+    # ปรับปรุง: เพิ่มทศนิยม 6 ตำแหน่งสำหรับเหรียญที่มีค่าน้อยมากแต่ไม่ถึงขนาดต้องใช้ 8 ตำแหน่ง เช่น FLOKI
+    if price < 0.0001:
         return f"{price:.8f}"
+    elif price < 0.001:
+        return f"{price:.6f}"
     elif price < 1:
         return f"{price:.4f}"
     else:
@@ -106,6 +109,8 @@ def scan_market():
     bullish_coins = 0
     bearish_coins = 0
     total_valid_coins = 0
+    
+    coin_trends_summary = [] # เก็บสถานะเทรนด์รายเหรียญเพื่อเอาไปสรุปด้านบนข้อความ
     
     for coin in COINS:
         df = get_historical_data(coin)
@@ -127,6 +132,7 @@ def scan_market():
         if current_price > ema_200:
             coin_trend = "🟢 ขาขึ้น (Above EMA 200)"
             bullish_coins += 1
+            coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น")
             
             # เงื่อนไขสัญญาณซื้อ (เช็คเฉพาะในตลาดขาขึ้นตามสคริปต์เดิม)
             signal_type = ""
@@ -156,6 +162,7 @@ def scan_market():
         else:
             coin_trend = "🔴 ขาลง (Below EMA 200)"
             bearish_coins += 1
+            coin_trends_summary.append(f"• {coin}: 🔴 ขาลง")
         
         # สัญญาณเตือนขาย (Overbought เช็คได้ทั้งขาขึ้นและขาลง)
         if rsi >= 65:
@@ -189,6 +196,10 @@ def scan_market():
             summary_msg += f"🔥 ภาพรวม: <b>🟡 ไซด์เวย์ / เลือกทาง (Sideways)</b>\n<i>กลยุทธ์: ตลาดก้ำกึ่ง ควรเลือกเทรดเฉพาะตัวที่มีสัญญาณชัดเจน</i>"
         else:
             summary_msg += f"🔥 ภาพรวม: <b>🔴 ขาลง / พักฐานแรง (Bearish)</b>\n<i>กลยุทธ์: ตลาดมีความเสี่ยงสูง เน้นถือเงินสดหรือลดขนาดไม้ลง</i>"
+            
+        # เพิ่มส่วนสรุปเทรนด์แยกรายเหรียญไว้ในหัวข้อความตามที่ขอมา
+        summary_msg += "\n\n📋 <b>สรุปแนวโน้มรายเหรียญ:</b>\n"
+        summary_msg += "\n".join(coin_trends_summary)
     else:
         summary_msg = "⚠️ ไม่สามารถดึงข้อมูลเหรียญเพื่อวิเคราะห์ภาพรวมได้"
             
