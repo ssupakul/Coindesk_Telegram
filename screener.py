@@ -126,50 +126,58 @@ def scan_market():
         
         total_valid_coins += 1
         is_divergence = check_bullish_divergence(df)
-        
-        # มัดจำค่า RSI ปัดทศนิยมไว้แสดงผล
         rsi_rounded = round(rsi, 2)
+        
+        # ปรับปรุง: ตั้งตัวแปรกลางสำหรับเช็คสัญญาณซื้อ
+        signal_type = ""
         
         if current_price > ema_200:
             coin_trend = "🟢 ขาขึ้น (Above EMA 200)"
             bullish_coins += 1
-            # ปรับปรุง: เพิ่มการแสดงผล RSI ต่อท้ายชื่อเหรียญในส่วนสรุปภาพรวม
             coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น (RSI: {rsi_rounded})")
             
-            signal_type = ""
+            # สัญญาณซื้อสำหรับขาขึ้น: เน้นย่อตัวบนแนวโน้มหลัก (Pullback) หรือ Divergence
             if current_price > (ema_50 * 0.98) and rsi <= 35:
                 signal_type = "RSI Oversold + Pullback 📉"
             elif is_divergence:
                 signal_type = "Bullish Divergence 📈"
-                
-            if signal_type:
-                entry_min = format_price(coin, current_price * 0.97)
-                entry_max = format_price(coin, current_price * 1.00)
-                target_profit = format_price(coin, current_price * 1.12) 
-                stop_loss = format_price(coin, ema_200 * 0.98)           
-                
-                buy_signals.append({
-                    "coin": coin, 
-                    "trend": coin_trend,
-                    "price": format_price(coin, current_price), 
-                    "rsi": rsi_rounded,
-                    "type": signal_type, 
-                    "ema_50": format_price(coin, ema_50), 
-                    "ema_200": format_price(coin, ema_200), 
-                    "entry": f"${entry_min} - ${entry_max}", 
-                    "tp": f"${target_profit}", 
-                    "sl": f"${stop_loss}"
-                })
         else:
             coin_trend = "🔴 ขาลง (Below EMA 200)"
             bearish_coins += 1
-            # ปรับปรุง: เพิ่มการแสดงผล RSI ต่อท้ายชื่อเหรียญในส่วนสรุปภาพรวมเช่นกัน
             coin_trends_summary.append(f"• {coin}: 🔴 ขาลง (RSI: {rsi_rounded})")
+            
+            # ปรับปรุง: เพิ่มเงื่อนไขให้แจ้งเตือนฝั่งขาลงด้วย (เน้นเล่นเด้ง Oversold หรือ Divergence ขาลง)
+            if rsi <= 35:
+                signal_type = "RSI Oversold (ขาลง-เสี่ยงสูง) 📉"
+            elif is_divergence:
+                signal_type = "Bullish Divergence (สวนเทรนด์) 📈"
+                
+        # ถ้ามีสัญญาณซื้อ (ไม่ว่าจะเกิดในขาขึ้นหรือขาลง) ให้บันทึกข้อมูล
+        if signal_type:
+            entry_min = format_price(coin, current_price * 0.97)
+            entry_max = format_price(coin, current_price * 1.00)
+            target_profit = format_price(coin, current_price * 1.12) 
+            # ถ้าเป็นขาลง ให้ใช้ราคาปัจจุบันคูณ 0.93 เป็น SL แทน เพราะไม่มีเส้น EMA 200 รับด้านล่าง
+            stop_loss_val = ema_200 * 0.98 if current_price > ema_200 else current_price * 0.93
+            stop_loss = format_price(coin, stop_loss_val)           
+            
+            buy_signals.append({
+                "coin": coin, 
+                "trend": coin_trend,
+                "price": format_price(coin, current_price), 
+                "rsi": rsi_rounded,
+                "type": signal_type, 
+                "ema_50": format_price(coin, ema_50), 
+                "ema_200": format_price(coin, ema_200), 
+                "entry": f"${entry_min} - ${entry_max}", 
+                "tp": f"${target_profit}", 
+                "sl": f"${stop_loss}"
+            })
         
+        # สัญญาณเตือนขาย (Overbought เช็คได้ทั้งสองฝั่งเหมือนเดิม)
         if rsi >= 65:
             tp_range_min = format_price(coin, current_price * 1.00)
             tp_range_max = format_price(coin, current_price * 1.05)
-            
             safety_exit_val = ema_50 if current_price > ema_50 else current_price * 0.95
             safety_exit = format_price(coin, safety_exit_val)
             
@@ -186,7 +194,6 @@ def scan_market():
             
     if total_valid_coins > 0:
         bullish_ratio = (bullish_coins / total_valid_coins) * 100
-        
         summary_msg = f"📊 <b>[Market Trend Summary]</b>\n"
         summary_msg += f"📈 ขาขึ้น: {bullish_coins} เหรียญ | 📉 ขาลง: {bearish_coins} เหรียญ\n"
         
