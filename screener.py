@@ -509,3 +509,57 @@ def scan_market():
         summary_msg = "⚠️ ไม่สามารถดึงข้อมูลเหรียญเพื่อวิเคราะห์ภาพรวมได้"
 
     return buy_signals, sell_signals, summary_msg
+
+
+# ==========================================
+# Execution Entry Point (ส่วนที่เพิ่มเข้ามาเพื่อให้บอตรัน)
+# ==========================================
+if __name__ == "__main__":
+    logger.info("🚀 เริ่มต้นระบบสแกนเหรียญคริปโต...")
+    
+    try:
+        # 1. รัน Scanner ประมวลผลหาตรรกะสัญญาณ
+        buy_signals, sell_signals, summary_msg = scan_market()
+        
+        # 2. จัดลิสต์ข้อความ (Chunks) เพื่อเตรียมส่งเข้า Telegram
+        telegram_chunks = []
+        
+        # ใส่ข้อมูลสรุปสภาวะตลาดชิ้นแรก
+        telegram_chunks.append(summary_msg)
+        
+        # จัดรูปแบบเมื่อพบสัญญาณซื้อ (BUY)
+        if buy_signals:
+            buy_msg = "🟢 <b>[BUY SIGNALS FOUND]</b>\n\n"
+            for sig in buy_signals:
+                buy_msg += f"<b>🪙 {sig['coin']} ({sig['trend']})</b>\n"
+                buy_msg += f"⚡ สัญญาณ: {sig['type']}\n"
+                buy_msg += f"💵 ราคาปัจจุบัน: ${sig['price']} (RSI: {sig['rsi']})\n"
+                buy_msg += f"📥 โซนเข้าซื้อ: {sig['entry']}\n"
+                buy_msg += f"{sig['tp']}\n"  # แสดงผลเป็นเป้าหมายทำกำไร TP1 และ TP2 สองบรรทัดอัตโนบัติตามที่ตั้งค่าไว้
+                buy_msg += f"🛑 Stop Loss: {sig['sl']}\n"
+                buy_msg += f"📊 เทรนด์: {sig['trend_info']['trend_label']}\n"
+                if sig['bounce_info']['entry_timing']:
+                    buy_msg += f"💡 คำแนะนำ: {sig['bounce_info']['entry_timing']}\n"
+                buy_msg += "---------------------\n"
+            telegram_chunks.append(buy_msg)
+            
+        # จัดรูปแบบเมื่อพบสัญญาณขาย / เตือนจุดเสี่ยงสูง (SELL)
+        if sell_signals:
+            sell_msg = "🔴 <b>[OVERBOUGHT / EXIT WARNING]</b>\n\n"
+            for sig in sell_signals:
+                sell_msg += f"<b>🪙 {sig['coin']}</b>\n"
+                sell_msg += f"⚠️ RSI สูงเกินไป (Overbought): {sig['rsi']} ({sig['trend']})\n"
+                sell_msg += f"💵 ราคาปัจจุบัน: ${sig['price']}\n"
+                sell_msg += f"🎯 โซนแบ่งขาย: {sig['tp_zone']}\n"
+                sell_msg += f"🛡️ จุดล็อกกำไร/หนีภัย (Exit): {sig['exit']}\n"
+                sell_msg += "---------------------\n"
+            telegram_chunks.append(sell_msg)
+            
+        # 3. เรียกใช้ฟังก์ชันส่งข้อมูลไปยัง Telegram API
+        logger.info(f"📬 กำลังจัดส่งข้อความเข้า Telegram ทั้งหมด {len(telegram_chunks)} ส่วน...")
+        send_telegram_messages(telegram_chunks)
+        
+        logger.info("🏁 ทำงานเสร็จสิ้นสมบูรณ์")
+        
+    except Exception as e:
+        logger.critical(f"💥 เกิดข้อผิดพลาดร้ายแรงในขณะรันระบบสแกนเนอร์: {e}", exc_info=True)
