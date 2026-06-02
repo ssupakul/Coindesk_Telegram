@@ -22,9 +22,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
 
+# อัปเดตเพิ่ม TRX, AVAX, SUI เข้าไปใน Watchlist
 COINS = [
     "BTC", "ETH", "BNB", "SOL", "XRP",
     "ADA", "FLOKI", "SHIB", "EIGEN", "OP", "DOGE", "NEAR",
+    "TRX", "AVAX", "SUI"
 ]
 
 # ==========================================
@@ -70,11 +72,14 @@ TP_TIERS = {
     "small":  {"tp1": 0.18, "tp2": 0.25, "sl_buffer": 0.03},
 }
 
+# อัปเดตการแบ่ง Tier เหรียญเพื่อคำนวณเป้าหมายราคาและ SL
 COIN_TIER = {
     "BTC": "major", "ETH": "major",
     "BNB": "mid",   "SOL": "mid",   "XRP": "mid",
     "ADA": "mid",   "NEAR": "mid",  "OP": "mid",
+    "TRX": "mid",   "AVAX": "mid",
     "FLOKI": "small","SHIB": "small","EIGEN": "small","DOGE": "small",
+    "SUI": "small"
 }
 
 
