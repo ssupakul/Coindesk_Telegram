@@ -123,7 +123,6 @@ def get_historical_data(coin: str) -> pd.DataFrame | None:
         "fsym": coin,
         "tsym": "USD",
         "limit": HISTOHOUR_LIMIT,
-        "e": "Binance",
         "api_key": CRYPTOCOMPARE_API_KEY,
     }
 
