@@ -127,7 +127,7 @@ def get_historical_data(coin: str) -> pd.DataFrame | None:
     url = "https://min-api.cryptocompare.com/data/v2/histohour"
     params = {
         "fsym": coin,
-        "tsym": "USD",
+        "tsym": "USDT",
         "limit": HISTOHOUR_LIMIT,
         "e": "Binance",
         "api_key": CRYPTOCOMPARE_API_KEY,
@@ -168,7 +168,7 @@ def get_historical_data(coin: str) -> pd.DataFrame | None:
 
 def analyze_weekly_context(coin: str) -> dict:
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": coin, "tsym": "USD", "limit": 1000, "api_key": CRYPTOCOMPARE_API_KEY}
+    params = {"fsym": coin, "tsym": "USDT", "limit": 1000, "api_key": CRYPTOCOMPARE_API_KEY}
     
     result = {
         "rsi_weekly": None,
@@ -256,7 +256,7 @@ def analyze_weekly_context(coin: str) -> dict:
 
 def analyze_monthly_targets(coin: str) -> dict:
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": coin, "tsym": "USD", "limit": 2000, "api_key": CRYPTOCOMPARE_API_KEY}
+    params = {"fsym": coin, "tsym": "USDT", "limit": 2000, "api_key": CRYPTOCOMPARE_API_KEY}
     
     result = {
         "m_resistance_target": None, "m_support_target": None,
@@ -306,7 +306,7 @@ def analyze_monthly_targets(coin: str) -> dict:
 
 def analyze_cycle_targets(coin: str) -> dict:
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": coin, "tsym": "USD", "limit": 2000, "api_key": CRYPTOCOMPARE_API_KEY}
+    params = {"fsym": coin, "tsym": "USDT", "limit": 2000, "api_key": CRYPTOCOMPARE_API_KEY}
     
     result = {"cycle_target_zone": None, "cycle_confluence_factors": [], "cycle_summary_label": "⏳ ไม่สามารถวิเคราะห์เป้าหมายไซเคิลได้"}
 
