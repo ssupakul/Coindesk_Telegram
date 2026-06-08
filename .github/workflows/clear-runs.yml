@@ -1,4 +1,4 @@
-Name: Clear Old Workflow Runs
+name: Clear Old Workflow Runs
 
 on:
   workflow_dispatch: 
