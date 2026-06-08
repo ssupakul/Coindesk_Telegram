@@ -18,8 +18,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
-          # --created "<3 days ago" หมายถึง เลือกเฉพาะรันที่ถูกสร้างขึ้นก่อน 3 วันที่แล้ว
-          gh run list --limit 100 --created "<3 days ago" --json databaseId --jq '.[].databaseId' | while read -r run_id; do
+          # --created "<1 days ago" หมายถึง เลือกเฉพาะรันที่ถูกสร้างขึ้นก่อน 1 วันที่แล้ว
+          gh run list --limit 100 --created "<1 days ago" --json databaseId --jq '.[].databaseId' | while read -r run_id; do
             if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
               echo "Skipping current run ID: $run_id"
               continue
