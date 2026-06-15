@@ -1,0 +1,87 @@
+name: Crypto Market Screener (Binance Direct API via VPNGate)
+
+# รับ Trigger จากภายนอก (Webhook) และปุ่มกดด้วยมือ
+on:
+  repository_dispatch:
+    types: [cron_trigger] # สอดคล้องกับ Event Type ที่ตั้งไว้ใน cron-job.org
+  workflow_dispatch: 
+
+permissions:
+  contents: write
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository code
+      uses: actions/checkout@v4.2.2
+      with:
+        persist-credentials: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v5.3.0
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 1. ติดตั้ง OpenVPN Client บน Ubuntu ของ GitHub Actions
+    - name: Install OpenVPN Client
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openvpn openvpn-systemd-resolved
+
+    # 2. ดึงข้อมูลเซิร์ฟเวอร์จาก VPNGate API แบบสดๆ และสร้างไฟล์ .ovpn อัตโนมัติ (แก้ไขบั๊ก base64 เรียบร้อยแล้ว)
+    - name: Fetch Dynamic VPNGate Configuration
+      run: |
+        echo "🌐 กำลังดึงรายชื่อเซิร์ฟเวอร์จาก VPNGate API..."
+        # ดึงไฟล์ CSV รายชื่อเซิร์ฟเวอร์ทั้งหมดจาก vpngate
+        curl -s http://www.vpngate.net/api/iphone/ > vpngate_list.csv
+        
+        # ค้นหาเซิร์ฟเวอร์เฉพาะประเทศ Japan (JP) หรือ Singapore (SG)
+        # ใช้ awk -F, '{print $NF}' ดึงคอลัมน์สุดท้าย (Base64) แน่นอน 100% พร้อมใช้ tr -d '\r' ล้างอักขระขยะของ Windows ออกก่อนถอดรหัส
+        grep -E ",JP,|,SG," vpngate_list.csv | head -n 5 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+        
+        # ตรวจสอบว่าสร้างไฟล์สำเร็จและมีขนาดมากกว่า 0 หรือไม่ (หากแผนแรกขัดข้อง ให้ใช้แผนสำรองในเอเชีย)
+        if [ ! -s config.ovpn ]; then
+          echo "❌ แผนหลักล้มเหลว (Base64 ผิดพลาด) กำลังสุ่มหาเซิร์ฟเวอร์สำรองในภูมิภาคเอเชีย..."
+          grep -E ",JP,|,SG,|,KR,|,TW," vpngate_list.csv | head -n 15 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+        fi
+        
+        # ตรวจสอบครั้งสุดท้าย ถ้ายังไม่ได้ไฟล์อีก ให้หยิบเซิร์ฟเวอร์ใดก็ได้ในระบบที่ไม่ใช่สหรัฐฯ (US) เพื่อหลบ Geo-block ของ Binance
+        if [ ! -s config.ovpn ]; then
+          echo "❌ แผนสำรองล้มเหลว กำลังเลือกเซิร์ฟเวอร์ที่เสถียรที่สุดตัวอื่นที่เปิดใช้งานได้..."
+          grep -v ",US," vpngate_list.csv | grep -v "#" | head -n 20 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+        fi
+        
+        echo "✅ สร้างไฟล์ config.ovpn จาก VPNGate สำเร็จ (ขนาดไฟล์: $(wc -c < config.ovpn) bytes)"
+
+    # 3. สั่งเชื่อมต่อ VPN และรอตรวจสอบสัญญาณจนกว่าเครื่องจำลองจะเปลี่ยน IP ได้สำเร็จ
+    - name: Establish VPN Connection
+      run: |
+        # รัน OpenVPN เป็นกระบวนการเบื้องหลัง (Background process / Daemon) โดยไม่ต้องใส่ user/pass
+        sudo openvpn --config config.ovpn --daemon
+        
+        echo "⏳ ตรวจสอบสถานะการเชื่อมต่อ VPN และรอการอัปเดตตำแหน่ง IP..."
+        # วนลูปตรวจสอบสูงสุด 15 ครั้ง ครั้งละ 3 วินาที เพื่อรอให้ Network Interface ของ VPN พร้อมทำงาน
+        for i in {1..15}; do
+          CURRENT_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "failed")
+          echo "กำลังตรวจสอบรอบที่ $i: IP ปัจจุบันของคุณคือ -> $CURRENT_IP"
+          if [ "$CURRENT_IP" != "failed" ]; then
+             echo "✅ VPN เชื่อมต่อสำเร็จ! ปลอดภัยจาก Geo-prohibit พร้อมเริ่มรันคำสั่งถัดไป"
+             break
+          fi
+          sleep 3
+        done
+
+    # 4. รันสคริปต์สแกนเนอร์ส่งตรงหา Binance Futures API (ดึงข้อมูลโดยตรง ไม่ใช้ CryptoCompare)
+    - name: Execute Screener Script
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python coindesk2_screener.py
