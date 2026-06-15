@@ -36,31 +36,28 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y openvpn openvpn-systemd-resolved
 
-    # 2. ดึงข้อมูลเซิร์ฟเวอร์จาก VPNGate API แบบสดๆ และสร้างไฟล์ .ovpn อัตโนมัติ (แก้ไขบั๊ก base64 เรียบร้อยแล้ว)
+    # 2. ดึงข้อมูลเซิร์ฟเวอร์จาก VPNGate API แบบสดๆ และสร้างไฟล์ .ovpn อัตโนมัติ
     - name: Fetch Dynamic VPNGate Configuration
       run: |
         echo "🌐 กำลังดึงรายชื่อเซิร์ฟเวอร์จาก VPNGate API..."
-        # ดึงไฟล์ CSV รายชื่อเซิร์ฟเวอร์ทั้งหมดจาก vpngate
         curl -s http://www.vpngate.net/api/iphone/ > vpngate_list.csv
         
-        # ค้นหาเซิร์ฟเวอร์เฉพาะประเทศ Japan (JP) หรือ Singapore (SG)
-        # ใช้ awk -F, '{print $NF}' ดึงคอลัมน์สุดท้าย (Base64) แน่นอน 100% พร้อมใช้ tr -d '\r' ล้างอักขระขยะของ Windows ออกก่อนถอดรหัส
-        grep -E ",JP,|,SG," vpngate_list.csv | head -n 5 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+        # ค้นหาเซิร์ฟเวอร์เฉพาะประเทศ ไต้หวัน (TW), เกาหลีใต้ (KR) หรือ เวียดนาม (VN) ซึ่งปลอดภัยจาก Geo-block
+        grep -E ",TW,|,KR,|,VN," vpngate_list.csv | head -n 5 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
         
-        # ตรวจสอบว่าสร้างไฟล์สำเร็จและมีขนาดมากกว่า 0 หรือไม่ (หากแผนแรกขัดข้อง ให้ใช้แผนสำรองในเอเชีย)
         if [ ! -s config.ovpn ]; then
-          echo "❌ แผนหลักล้มเหลว (Base64 ผิดพลาด) กำลังสุ่มหาเซิร์ฟเวอร์สำรองในภูมิภาคเอเชีย..."
-          grep -E ",JP,|,SG,|,KR,|,TW," vpngate_list.csv | head -n 15 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+          echo "❌ แผนหลักล้มเหลว กำลังสุ่มหาเซิร์ฟเวอร์สำรองในภูมิภาคเอเชีย..."
+          grep -E ",TW,|,KR,|,VN,|,HK," vpngate_list.csv | head -n 15 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
         fi
         
-        # ตรวจสอบครั้งสุดท้าย ถ้ายังไม่ได้ไฟล์อีก ให้หยิบเซิร์ฟเวอร์ใดก็ได้ในระบบที่ไม่ใช่สหรัฐฯ (US) เพื่อหลบ Geo-block ของ Binance
         if [ ! -s config.ovpn ]; then
           echo "❌ แผนสำรองล้มเหลว กำลังเลือกเซิร์ฟเวอร์ที่เสถียรที่สุดตัวอื่นที่เปิดใช้งานได้..."
           grep -v ",US," vpngate_list.csv | grep -v "#" | head -n 20 | tail -n 1 | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
         fi
         
-        echo "✅ สร้างไฟล์ config.ovpn จาก VPNGate สำเร็จ (ขนาดไฟล์: $(wc -c < config.ovpn) bytes)"
+        echo "✅ สร้างไฟล์ config.ovpn สำเร็จ (ขนาดไฟล์: $(wc -c < config.ovpn) bytes)"
 
+    
     # 3. สั่งเชื่อมต่อ VPN และรอตรวจสอบสัญญาณจนกว่าเครื่องจำลองจะเปลี่ยน IP ได้สำเร็จ
     - name: Establish VPN Connection
       run: |
