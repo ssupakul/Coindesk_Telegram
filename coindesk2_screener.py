@@ -104,7 +104,7 @@ retry_strategy = Retry(
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET"]
 )
-adapter = HTTPAdapter(max_connections=15, pool_connections=15, pool_maxsize=15)
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=15, pool_maxsize=15)
 api_session.mount("https://", adapter)
 
 # ==========================================
