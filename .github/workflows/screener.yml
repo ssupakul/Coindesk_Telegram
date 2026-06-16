@@ -3,7 +3,7 @@ name: Crypto Market Screener (Binance Direct API via VPNGate)
 # รับ Trigger จากภายนอก (Webhook) และปุ่มกดด้วยมือ
 on:
   repository_dispatch:
-    types: [cron_trigger] # สอดคล้องกับ Event Type ที่ตั้งไว้ใน cron-job.org
+    types: [trigger-screener] # สอดคล้องกับ Event Type ที่ตั้งไว้ใน cron-job.org
   workflow_dispatch: 
 
 permissions:
@@ -81,4 +81,4 @@ jobs:
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python screener.py
+      run: python coindesk2_screener.py
