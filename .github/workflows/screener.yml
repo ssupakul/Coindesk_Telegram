@@ -1,0 +1,121 @@
+name: Crypto Market Screener (Binance Direct API via VPNGate)
+
+# รับ Trigger จากภายนอก (Webhook) และปุ่มกดด้วยมือ
+on:
+  repository_dispatch:
+    types: [trigger-screener] # สอดคล้องกับ Event Type ที่ตั้งไว้ใน cron-job.org
+  workflow_dispatch: 
+
+permissions:
+  contents: write
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository code
+      uses: actions/checkout@v4.2.2
+      with:
+        persist-credentials: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v5.3.0
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 1. ติดตั้ง OpenVPN Client บน Ubuntu ของ GitHub Actions
+    - name: Install OpenVPN Client
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openvpn openvpn-systemd-resolved
+
+    # 2. ดึงรายชื่อเซิร์ฟเวอร์ "ผู้สมัคร" หลายตัวจาก VPNGate API แบบสดๆ (ไม่ฟันธงเลือกตัวเดียวที่นี่)
+    #    [FIX VPN] เดิมเลือกเซิร์ฟเวอร์ตัวเดียวตามตำแหน่งบรรทัดแบบสุ่ม โดยไม่ตรวจสอบว่าใช้งานได้จริงหรือไม่
+    #    เปลี่ยนมาเก็บรายชื่อผู้สมัครไว้ก่อน แล้วค่อยไล่ลองทีละตัวในสเต็ปถัดไปจนกว่าจะเจอตัวที่ใช้ได้จริง
+    - name: Fetch Dynamic VPNGate Candidate List
+      run: |
+        echo "🌐 กำลังดึงรายชื่อเซิร์ฟเวอร์จาก VPNGate API..."
+        curl -s http://www.vpngate.net/api/iphone/ > vpngate_list.csv
+
+        # เรียงลำดับผู้สมัคร: เอเชียที่ปลอดภัยจาก Geo-block ก่อน (TW/KR/VN/HK/JP/SG) แล้วค่อยตามด้วยประเทศอื่นที่ไม่ใช่ US
+        grep -E ",TW,|,KR,|,VN,|,HK,|,JP,|,SG," vpngate_list.csv | grep -v "^#" > candidates.csv
+        grep -v ",US," vpngate_list.csv | grep -v "^#" | grep -vE ",TW,|,KR,|,VN,|,HK,|,JP,|,SG," >> candidates.csv
+
+        echo "✅ พบเซิร์ฟเวอร์ผู้สมัครทั้งหมด $(wc -l < candidates.csv) ตัว"
+
+    # 3. ไล่ลองเชื่อมต่อ VPN ทีละเซิร์ฟเวอร์จนกว่าจะ "ยืนยันได้จริง" ว่าเข้าถึง Binance Futures API ได้
+    #    [FIX VPN] เดิมเช็คแค่ว่า curl ไป ipify.org สำเร็จหรือไม่ ซึ่งไม่ได้พิสูจน์ว่า:
+    #      (ก) traffic วิ่งผ่าน VPN tunnel จริง (เทียบกับ IP ก่อนต่อ VPN)
+    #      (ข) ปลายทาง Binance เข้าถึงได้จริง (ไม่ใช่แค่เน็ตทั่วไปใช้ได้)
+    #    เซิร์ฟเวอร์ VPNGate มักถูก Binance ขึ้นบัญชีดำเป็นช่วงๆ (เพราะ IP สาธารณะเปิดเผยผ่าน API)
+    #    จึงต้องมี fallback ไล่ลองหลายตัว ไม่ใช่พึ่งตัวเดียว
+    - name: Establish VPN Connection (verify against Binance, fallback across servers)
+      id: vpn
+      run: |
+        ORIGINAL_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "unknown")
+        echo "IP ก่อนเชื่อม VPN: $ORIGINAL_IP"
+
+        CONNECTED=false
+        MAX_CANDIDATES=10
+
+        for n in $(seq 1 $MAX_CANDIDATES); do
+          LINE=$(sed -n "${n}p" candidates.csv)
+          if [ -z "$LINE" ]; then
+            echo "หมดรายชื่อผู้สมัครแล้ว (ลองไป $((n-1)) ตัว)"
+            break
+          fi
+
+          echo "$LINE" | awk -F, '{print $NF}' | tr -d '\r' | base64 -d > config.ovpn 2>/dev/null || true
+          if [ ! -s config.ovpn ]; then
+            echo "[ลองตัวที่ $n] ไฟล์ config ว่าง ข้ามไปตัวถัดไป"
+            continue
+          fi
+
+          sudo pkill openvpn 2>/dev/null || true
+          sleep 1
+          sudo openvpn --config config.ovpn --daemon
+          sleep 6   # ให้เวลา handshake ของ tunnel ตั้งตัว
+
+          CURRENT_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "failed")
+          BINANCE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 https://fapi.binance.com/fapi/v1/ping || echo "000")
+          echo "[ลองตัวที่ $n] IP=$CURRENT_IP | Binance HTTP=$BINANCE_STATUS"
+
+          if [ "$CURRENT_IP" != "failed" ] && [ "$CURRENT_IP" != "$ORIGINAL_IP" ] && [ "$BINANCE_STATUS" == "200" ]; then
+            echo "✅ เซิร์ฟเวอร์ตัวที่ $n เชื่อมต่อสำเร็จและเข้าถึง Binance ได้จริง!"
+            CONNECTED=true
+            break
+          fi
+        done
+
+        echo "VPN_CONNECTED=$CONNECTED" >> "$GITHUB_ENV"
+
+        if [ "$CONNECTED" != "true" ]; then
+          echo "❌ ลองครบทุกเซิร์ฟเวอร์ผู้สมัครแล้ว ไม่มีตัวไหนเข้าถึง Binance ได้เลยในรอบนี้"
+        fi
+
+    # 4. รันสคริปต์สแกนเนอร์เฉพาะเมื่อยืนยันแล้วว่า VPN เข้าถึง Binance ได้จริง
+    - name: Execute Screener Script
+      if: env.VPN_CONNECTED == 'true'
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python coindesk1_screener.py
+
+    # 5. แจ้งเตือนแบบสั้นๆ ผ่าน Telegram หาก VPN ใช้ไม่ได้เลยในรอบนี้ (ข้าม cycle อย่างมีข้อมูล แทนที่จะเงียบหาย)
+    - name: Notify VPN Failure (skip cycle)
+      if: env.VPN_CONNECTED != 'true'
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d chat_id="${TELEGRAM_CHAT_ID}" \
+          -d text="⚠️ ข้าม Cycle นี้: ลอง VPNGate ครบทุกเซิร์ฟเวอร์ผู้สมัครแล้วเข้าถึง Binance ไม่ได้ ระบบจะลองใหม่อัตโนมัติรอบถัดไป"
+
