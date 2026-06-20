@@ -1,0 +1,1207 @@
+import os
+import sys
+import time
+import math
+import logging
+import re
+import requests
+import pandas as pd
+import numpy as np
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ==========================================
+# Logging Configuration
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# Custom Exceptions
+# ==========================================
+class BinanceBlockedError(Exception):
+    """เกิดขึ้นเมื่อ Binance ตอบกลับ HTTP 451 (Geo/VPN block)
+    บ่งชี้ว่า VPN tunnel ในรอบนี้ใช้ไม่ได้จริง ไม่มีประโยชน์ที่จะสแกนเหรียญอื่นต่อ"""
+    pass
+
+# ==========================================
+# Environment Variables & Risk Management
+# ==========================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+PORTFOLIO_USDT = 1500.0   
+RISK_PER_TRADE_PCT = 2.0  
+
+COINS = [
+    "BTC", "ETH", "BNB", "SOL", "XRP",
+    "ADA", "FLOKI", "SHIB", "EIGEN", "OP", "DOGE", "NEAR",
+    "TRX", "AVAX", "SUI"
+]
+
+# ==========================================
+# Constants & Hyperparameters (Binance Connect Mode)
+# ==========================================
+BINANCE_FUTURES_URL = "https://fapi.binance.com"
+API_RATE_LIMIT_DELAY = 0.35
+API_MAX_RETRIES = 3
+
+# --- Indicators ---
+RSI_PERIOD = 14
+EMA_SHORT = 50
+EMA_LONG = 200
+RSI_OVERSOLD = 32
+RSI_OVERBOUGHT = 70
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 2.5 
+
+# --- RSI Recovery & Pullback Configuration ---
+RSI_RECOVERY_THRESHOLD = 45
+RSI_PULLBACK_THRESHOLD = 55
+RSI_RECOVERY_LOOKBACK = 5
+
+# --- Divergence Configuration ---
+RSI_BULL_DIV_MAX = 45
+RSI_BEAR_DIV_MIN = 55
+LOOKBACK_BARS = 15
+LOOKBACK_SKIP_BARS = 3
+
+# --- Trend Continuity Configuration ---
+TREND_SLOPE_BARS = 5          
+TREND_MIN_CONSECUTIVE = 3     
+
+# --- RSI Bounce Configuration ---
+RSI_BOUNCE_CONFIRM_BARS = 2   
+RSI_BOUNCE_MIN_RISE = 3.0     
+
+# --- Order Block (SMC) & FVG Configuration ---
+OB_LOOKBACK = 20              
+OB_IMBALANCE_RATIO = 1.5      
+FVG_THRESHOLD_PCT = 0.2       
+
+# --- Take Profit Tiers ---
+TP_TIERS = {
+    "major":  {"tp1": 0.10, "tp2": 0.15, "sl_buffer": 0.025},
+    "mid":    {"tp1": 0.15, "tp2": 0.20, "sl_buffer": 0.050},
+    "small":  {"tp1": 0.20, "tp2": 0.35, "sl_buffer": 0.080},
+}
+
+COIN_TIER = {
+    "BTC": "major", "ETH": "major",
+    "BNB": "mid",   "SOL": "mid",   "XRP": "mid",
+    "ADA": "mid",   "NEAR": "mid",  "OP": "mid",
+    "TRX": "mid",   "AVAX": "mid",
+    "FLOKI": "small","SHIB": "small","EIGEN": "small","DOGE": "small",
+    "SUI": "small"
+}
+
+# ==========================================
+# Optimization 1: Global API Session Setup & Anti-Bot Headers
+# ==========================================
+api_session = requests.Session()
+api_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+})
+
+retry_strategy = Retry(
+    total=API_MAX_RETRIES,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+# แก้ไข Parameter ของ HTTPAdapter ให้ถูกต้อง
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=15, pool_maxsize=15)
+api_session.mount("https://", adapter)
+
+# ==========================================
+# Telegram Integration
+# ==========================================
+def send_telegram_messages(chunks: list) -> None:
+    token = str(TELEGRAM_BOT_TOKEN or "").strip()
+    chat_id = str(TELEGRAM_CHAT_ID or "").strip()
+
+    if not token or not chat_id:
+        logger.error("TELEGRAM_BOT_TOKEN หรือ TELEGRAM_CHAT_ID ไม่ได้ตั้งค่าใน Environment Variables")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    for idx, chunk in enumerate(chunks, start=1):
+        if not chunk.strip():
+            continue
+
+        payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logger.info(f"Telegram ส่งสำเร็จ (ส่วน {idx}/{len(chunks)})")
+            elif resp.status_code == 400 and "can't parse entities" in resp.text:
+                # [FIX] กัน HTML parse error ทำให้ข้อความหายไปทั้งก้อนเงียบๆ
+                # 1) log บริบทรอบจุดที่ parse error เพื่อ debug หาสาเหตุที่แท้จริงได้ในรันถัดไป
+                # 2) fallback ส่งแบบ plain text (ตัดแท็ก HTML ออก) แทน เพื่อให้สัญญาณยังถึงผู้ใช้แน่นอน
+                logger.warning(f"Telegram HTML parse error (ส่วน {idx}): {resp.text}")
+                try:
+                    m = re.search(r"byte offset (\d+)", resp.text)
+                    if m:
+                        offset = int(m.group(1))
+                        chunk_bytes = chunk.encode("utf-8")
+                        snippet = chunk_bytes[max(0, offset - 60): offset + 60].decode("utf-8", errors="replace")
+                        logger.warning(f"บริบทรอบจุดที่ Parse error (ส่วน {idx}): ...{snippet}...")
+                except Exception:
+                    pass
+
+                plain_text = re.sub(r"<[^>]+>", "", chunk)
+                try:
+                    fb_resp = requests.post(url, json={"chat_id": chat_id, "text": plain_text}, timeout=10)
+                    if fb_resp.status_code == 200:
+                        logger.info(f"Telegram ส่งสำเร็จแบบ plain text fallback (ส่วน {idx}/{len(chunks)})")
+                    else:
+                        logger.error(f"Telegram fallback ส่งล้มเหลวเช่นกัน (ส่วน {idx}): {fb_resp.text}")
+                except Exception as fe:
+                    logger.error(f"Exception ขณะส่ง Telegram fallback (ส่วน {idx}): {fe}")
+            else:
+                logger.warning(f"Telegram ส่งล้มเหลว (ส่วน {idx}): {resp.text}")
+        except Exception as e:
+            logger.error(f"Exception ขณะส่ง Telegram (ส่วน {idx}): {e}")
+
+        if idx < len(chunks):
+            time.sleep(0.5)
+
+# ==========================================
+# Binance Native Data Fetching System
+# ==========================================
+def get_futures_symbol(coin: str) -> str:
+    """แปลงชื่อเหรียญปกติให้ตรงกับกระดาน Binance Futures"""
+    special_coins = {
+        "FLOKI": "1000FLOKIUSDT",
+        "SHIB": "1000SHIBUSDT",
+    }
+    return special_coins.get(coin.upper(), f"{coin.upper()}USDT")
+
+def fetch_binance_klines(coin: str, interval: str, limit: int = 500) -> pd.DataFrame | None:
+    """ฟังก์ชันกลางในการดึงข้อมูลแท่งเทียนโดยตรงจาก Binance Futures API"""
+    symbol = get_futures_symbol(coin)
+    url = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+    
+    try:
+        resp = api_session.get(url, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            # โครงสร้างอาร์เรย์แท่งเทียนของ Binance API
+            df = pd.DataFrame(data, columns=[
+                "time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_asset_volume", "number_of_trades",
+                "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+            ])
+            
+            # จัดการแปลงประเภทข้อมูลให้ถูกต้องและแมปกับระบบเดิม
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+            df.set_index("time", inplace=True)
+            
+            # แปลง Object เป็น Float เพื่อให้คำนวณทางคณิตศาสตร์ได้
+            for col in ["open", "high", "low", "close", "volume", "quote_asset_volume"]:
+                df[col] = df[col].astype(float)
+            
+            # แมปชื่อคอลัมน์ volume ภาพรวมให้ตรงกับโครงสร้างประมวลผลอินดิเคเตอร์เดิม
+            df["volumeto"] = df["quote_asset_volume"]
+            return df
+        elif resp.status_code == 451:
+            # [FIX VPN] 451 = Binance บล็อก IP ตามกฎหมาย/ภูมิภาค บ่งชี้ว่า VPN tunnel ใช้ไม่ได้จริง
+            # ยกข้อยกเว้นเฉพาะขึ้นไป เพื่อให้ scan_market() ตัดสินใจหยุดรอบได้ทันที แทนที่จะไล่ยิง
+            # request เปล่าประโยชน์ไปอีก ~30 ครั้งจนครบทุกเหรียญ
+            logger.warning(f"{coin} ({interval}): Binance บล็อก IP -> 451 (VPN ไม่ได้ผลในรอบนี้)")
+            raise BinanceBlockedError(f"451 ที่ {coin} ({interval})")
+        else:
+            logger.warning(f"{coin} ({interval}): Binance ตอบกลับสถานะผิดพลาด -> {resp.status_code}")
+    except BinanceBlockedError:
+        raise
+    except Exception as e:
+        logger.warning(f"{coin} ({interval}) Fetch Exception: {e}")
+    return None
+
+def get_historical_data(coin: str) -> pd.DataFrame | None:
+    """ดึงข้อมูล 4H โดยตรงจากคู่เทรดล่วงหน้า (Futures) ของ Binance"""
+    return fetch_binance_klines(coin, interval="4h", limit=500)
+
+def get_histoday_data(coin: str) -> pd.DataFrame | None:
+    """ดึงข้อมูลโครงสร้างวัน (1D) โดยตรงจากคู่เทรดล่วงหน้าของ Binance"""
+    return fetch_binance_klines(coin, interval="1d", limit=500)
+
+# ==========================================
+# Refactored Analytical Logic Modules
+# ==========================================
+def analyze_weekly_context(df_1d: pd.DataFrame) -> dict:
+    result = {
+        "rsi_weekly": None,
+        "weekly_bullish_div": False,
+        "weekly_status_label": "↔️ ไม่พบข้อมูลระบุระดับสัปดาห์ชัดเจน",
+        "fibo_618": None,
+        "fibo_786": None,
+        "fibo_886": None,
+        "liquidity_pool": None,
+        "psycho_support": None
+    }
+
+    if df_1d is None or len(df_1d) < RSI_PERIOD + LOOKBACK_BARS + 5:
+        return result
+
+    try:
+        df_w = df_1d.resample("W").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+
+        if len(df_w) < RSI_PERIOD + LOOKBACK_BARS + 5:
+            return result
+
+        # --- Macro Fibonacci & Liquidity Pools ---
+        fibo_window = df_w.iloc[-52:]  # ย้อนหลัง 1 ปีสัปดาห์
+        w_max = fibo_window["high"].max()
+        w_min = fibo_window["low"].min() 
+        w_diff = w_max - w_min
+        
+        result["fibo_618"] = w_max - (0.618 * w_diff)
+        result["fibo_786"] = w_max - (0.786 * w_diff)
+        result["fibo_886"] = w_max - (0.886 * w_diff)
+        result["liquidity_pool"] = w_min
+
+        # --- Psychological Support ---
+        # [FIX Bug 3] ใช้ชื่อตัวแปรที่ชัดเจนขึ้นเพื่อหลีกเลี่ยงการชนกับตัวแปรชื่อเดียวกันในบล็อคถัดไป
+        curr_weekly_close = df_w["close"].iloc[-1]
+        if curr_weekly_close > 0:
+            magnitude = 10 ** math.floor(math.log10(curr_weekly_close))
+            step = magnitude if curr_weekly_close >= magnitude * 2 else magnitude / 2
+            result["psycho_support"] = math.floor(curr_weekly_close / step) * step
+
+        # --- RSI & Divergence Calculation ---
+        close = df_w["close"]
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+        avg_loss = loss.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        df_w["RSI"] = (100 - (100 / (1 + rs))).fillna(100)
+
+        curr_rsi_w = round(df_w["RSI"].iloc[-1], 2)
+        result["rsi_weekly"] = curr_rsi_w
+
+        prev_window = df_w.iloc[-(LOOKBACK_BARS + 1) : -(LOOKBACK_SKIP_BARS)]
+        if len(prev_window) > 0:
+            min_low_idx = prev_window["low"].argmin()
+            prev_low_price = prev_window["low"].iloc[min_low_idx]
+            prev_low_rsi   = prev_window["RSI"].iloc[min_low_idx]
+            curr_price_w = df_w["low"].iloc[-1]
+            curr_rsi_w_now = df_w["RSI"].iloc[-1]
+
+            if (prev_low_rsi <= RSI_BULL_DIV_MAX) and (curr_price_w < prev_low_price) and (curr_rsi_w_now > prev_low_rsi):
+                result["weekly_bullish_div"] = True
+
+        if result["weekly_bullish_div"]:
+            result["weekly_status_label"] = f"👑 <b>เกิด Weekly Bullish Divergence ในระดับภาพใหญ่!</b> (RSI: {curr_rsi_w})"
+        elif curr_rsi_w <= RSI_OVERSOLD:
+            result["weekly_status_label"] = f"🔥 <b>ภาพใหญ่เข้าเขต Oversold รุนแรง ({curr_rsi_w})</b>"
+        elif curr_weekly_close <= result["fibo_786"]:
+            result["weekly_status_label"] = f"⚠️ ราคาลงมาทดสอบโซน Deep Discount (ใต้ Fibo 78.6%)"
+        elif curr_rsi_w >= RSI_OVERBOUGHT:
+            result["weekly_status_label"] = f"⚠️ ภาพใหญ่เกิด Overbought ({curr_rsi_w}) ระวังความเสี่ยงการปรับฐาน"
+        else:
+            result["weekly_status_label"] = f"↔️ ภาพใหญ่ทรงตัวปกติ (RSI 1W: {curr_rsi_w})"
+
+    except Exception as e:
+        logger.error(f"Error calculating Weekly Context from 1D Data: {e}")
+        
+    return result
+
+def analyze_monthly_targets(df_1d: pd.DataFrame) -> dict:
+    result = {
+        "m_resistance_target": None, "m_support_target": None,
+        "monthly_summary_label": "⏳ ไม่สามารถคำนวณเป้าหมายระดับเดือนได้", "monthly_trend": "sideways"
+    }
+
+    if df_1d is None or len(df_1d) < 30: 
+        return result
+
+    try:
+        df_m = df_1d.resample("ME").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+
+        if len(df_m) < 3: return result
+
+        last_month = df_m.iloc[-2]
+        current_month = df_m.iloc[-1]
+        m_high, m_low, m_close = last_month["high"], last_month["low"], last_month["close"]
+        
+        pivot = (m_high + m_low + m_close) / 3
+        r1 = (2 * pivot) - m_low
+        s1 = (2 * pivot) - m_high
+        
+        if len(df_m) >= 12:
+            df_m["EMA_12"] = df_m["close"].ewm(span=12, adjust=False).mean()
+            m_ema12 = df_m["EMA_12"].iloc[-1]
+        else:
+            m_ema12 = pivot
+
+        curr_price = current_month["close"]
+        
+        if curr_price >= m_ema12:
+            target_up, target_down, trend_status = max(r1, m_high), pivot, "bullish"
+            status_text = "🔮 <b>ภาพ 1M (Bullish):</b> ทิศทางหลักเป็นขาขึ้น มีเป้าหมายราคาวิ่งทดสอบกรอบบน"
+        else:
+            target_up, target_down, trend_status = pivot, min(s1, m_low), "bearish"
+            status_text = "🔮 <b>ภาพ 1M (Bearish):</b> ทิศทางหลักเป็นขาลง/พักฐาน มีแนวโน้มไหลลงหาแนวรับกรอบล่าง"
+
+        result.update({"m_resistance_target": target_up, "m_support_target": target_down, "monthly_summary_label": status_text, "monthly_trend": trend_status})
+    except Exception:
+        pass
+    return result
+
+def analyze_cycle_targets(df_1d: pd.DataFrame) -> dict:
+    result = {"cycle_target_zone": None, "cycle_confluence_factors": [], "cycle_summary_label": "⏳ ไม่สามารถวิเคราะห์เป้าหมายไซเคิลได้"}
+
+    if df_1d is None or len(df_1d) < 100: 
+        return result
+
+    try:
+        df_w = df_1d.resample("W").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+
+        if len(df_w) < 20: return result
+
+        curr_price = df_w["close"].iloc[-1]
+        df_w["EMA_50"] = df_w["close"].ewm(span=50, adjust=False).mean()
+        df_w["EMA_200"] = df_w["close"].ewm(span=200, adjust=False).mean()
+        w_ema50, w_ema200 = df_w["EMA_50"].iloc[-1], df_w["EMA_200"].iloc[-1]
+
+        macro_window = df_w.iloc[-104:] if len(df_w.iloc[-104:]) > 0 else df_w
+        macro_high, macro_low = macro_window["high"].max(), macro_window["low"].min()
+        
+        fib_1618_ext = macro_low + ((macro_high - macro_low) * 1.618)
+        fib_0618_ret = macro_low + ((macro_high - macro_low) * 0.618)
+
+        potential_targets = []
+        if macro_high > curr_price * 1.1: potential_targets.append(("Historical Resistance (Previous Top)", macro_high))
+        if fib_0618_ret > curr_price * 1.1: potential_targets.append(("Macro Fibonacci 61.8% (Golden Pocket)", fib_0618_ret))
+        if fib_1618_ext > curr_price * 1.1: potential_targets.append(("Fibonacci Extension 161.8%", fib_1618_ext))
+        if w_ema50 > curr_price * 1.05: potential_targets.append(("Weekly EMA 50 (Dynamic Resistance)", w_ema50))
+        if w_ema200 > curr_price * 1.05: potential_targets.append(("Weekly EMA 200 (Macro Trendline)", w_ema200))
+
+        potential_targets.sort(key=lambda x: x[1])
+        confluence_zones = []
+        
+        for i in range(len(potential_targets)):
+            cluster = [potential_targets[i]]
+            for j in range(i + 1, len(potential_targets)):
+                if (potential_targets[j][1] - cluster[0][1]) / cluster[0][1] <= 0.10:
+                    cluster.append(potential_targets[j])
+            
+            if len(cluster) >= 2:
+                avg_price = sum([item[1] for item in cluster]) / len(cluster)
+                factors = [item[0] for item in cluster]
+                if not any(abs(avg_price - cz['price']) / cz['price'] < 0.1 for cz in confluence_zones):
+                    confluence_zones.append({"price": avg_price, "min_zone": cluster[0][1], "max_zone": cluster[-1][1], "factors": factors})
+
+        if confluence_zones:
+            primary_target = confluence_zones[0]
+            result["cycle_target_zone"] = f"${format_price(primary_target['min_zone'])} - ${format_price(primary_target['max_zone'])}"
+            result["cycle_confluence_factors"] = primary_target["factors"]
+            factors_str = " และ ".join(primary_target["factors"])
+            result["cycle_summary_label"] = f"🎯 <b>เป้าหมายรอบไซเคิล (Confluence):</b> <code>{result['cycle_target_zone']}</code>\n   <i>(จุดบรรจบของ: {factors_str})</i>"
+        elif potential_targets:
+            next_target = potential_targets[0]
+            result["cycle_target_zone"] = f"${format_price(next_target[1])}"
+            result["cycle_summary_label"] = f"🎯 <b>เป้าหมายรอบไซเคิล:</b> <code>${format_price(next_target[1])}</code>\n   <i>(อ้างอิงจาก: {next_target[0]})</i>"
+
+    except Exception:
+        pass
+    return result
+
+def check_death_cross_1d(df_1d: pd.DataFrame) -> dict:
+    result = {
+        "has_death_cross": False,
+        "death_cross_label": "⚪ 1D Death Cross: ปลอดภัย (ยังไม่เกิดการตัดลง)"
+    }
+
+    if df_1d is None or len(df_1d) < 200:
+        return result
+
+    try:
+        df = df_1d.copy()
+        df["close"] = pd.to_numeric(df["close"])
+        
+        # [FIX] Check if EMA columns already exist to avoid redundant calculations
+        if "EMA_50" not in df.columns:
+            df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
+        if "EMA_200" not in df.columns:
+            df["EMA_200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+        df_last_30 = df.iloc[-30:]
+        
+        for i in range(1, len(df_last_30)):
+            prev_50 = df_last_30["EMA_50"].iloc[i-1]
+            prev_200 = df_last_30["EMA_200"].iloc[i-1]
+            curr_50 = df_last_30["EMA_50"].iloc[i]
+            curr_200 = df_last_30["EMA_200"].iloc[i]
+
+            if prev_50 >= prev_200 and curr_50 < curr_200:
+                result["has_death_cross"] = True
+                result["death_cross_label"] = "☠️ <b>Warning! เกิด Death Cross (1D) ในช่วง 1 เดือนที่ผ่านมา</b> (เทรนด์หลักอาจเปลี่ยนเป็นขาลงยาว)"
+                break
+    except Exception as e:
+        logger.warning(f"Error checking Death Cross: {e}")
+        
+    return result
+
+def analyze_onchain_momentum(coin: str) -> dict:
+    """ยกเลิกความจำเป็นในการดึงข้อมูล Onchain จากค่ายอื่น หันมาอ้างอิงพฤติกรรมโวลุ่มจากตัวตลาด Futures"""
+    result = {
+        "onchain_warning": False,
+        "onchain_label": "🔹 Market Momentum: โครงสร้างโวลุ่มตลาดทำงานได้สอดคล้องตามกลไกราคาปกติ",
+        "large_tx_change_pct": 0.0
+    }
+    return result
+
+def analyze_futures_context(coin: str, bulk_funding_rate: float | None) -> dict:
+    """วิเคราะห์ข้อมูลฟิวเจอร์ส โดยลดการเรียก API Funding Rate รายตัวสลับไปใช้ข้อมูลชุด Bulk ล่าสุดแทน"""
+    result = {
+        "futures_warning": False,
+        "futures_label": "📊 Futures (1M): ปกติ / ไม่มีข้อมูลเด่นชัด"
+    }
+    symbol = get_futures_symbol(coin)
+    
+    try:
+        # เปิดข้อมูลประวัติ Open Interest ย้อนหลังผ่านตลาดฟิวเจอร์สโดยตรง
+        oi_url = f"{BINANCE_FUTURES_URL}/futures/data/openInterestHist"
+        oi_params = {"symbol": symbol, "period": "1d", "limit": 30}
+        oi_resp = api_session.get(oi_url, params=oi_params, timeout=10)
+
+        if oi_resp.status_code == 200 and bulk_funding_rate is not None:
+            oi_data = oi_resp.json()
+
+            if len(oi_data) >= 2:
+                first_oi = float(oi_data[0]['sumOpenInterestValue'])
+                last_oi = float(oi_data[-1]['sumOpenInterestValue'])
+                oi_change_pct = ((last_oi - first_oi) / first_oi) * 100 if first_oi > 0 else 0
+
+                # แปลงค่า Funding Rate เป็นเปอร์เซ็นต์
+                funding_pct = bulk_funding_rate * 100
+
+                if oi_change_pct > 25.0 and funding_pct > 0.015:
+                    result["futures_warning"] = True
+                    result["futures_label"] = f"🚨 <b>Futures Warning: ระวัง Long Squeeze!</b> OI พุ่ง {oi_change_pct:.1f}% พร้อม Funding Rate ล่าสุดบวกเดือด ({funding_pct:.4f}%) ตลาดเสี่ยงดัมพ์กวาด Long"
+                elif oi_change_pct > 25.0 and funding_pct < -0.015:
+                    result["futures_warning"] = True
+                    result["futures_label"] = f"🚨 <b>Futures Warning: ระวัง Short Squeeze!</b> OI พุ่ง {oi_change_pct:.1f}% แต่ Funding Rate ล่าสุดติดลบหนัก ({funding_pct:.4f}%) ตลาดเสี่ยงปั๊มสวน"
+                else:
+                    result["futures_label"] = f"📊 Futures: ปกติ (OI เปลี่ยนแปลง {oi_change_pct:+.1f}%, FR ล่าสุด {funding_pct:.4f}%)"
+                    
+    except Exception:
+        pass
+
+    return result
+
+# ==========================================
+# Indicators & Technical Logic Calculations
+# ==========================================
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    
+    df["EMA_50"] = close.ewm(span=EMA_SHORT, adjust=False).mean()
+    df["EMA_200"] = close.ewm(span=EMA_LONG, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = (100 - (100 / (1 + rs))).fillna(100)
+
+    # ATR (Average True Range)
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
+    
+    # ADX
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    atr_safe = df["ATR"].replace(0, np.nan)
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
+    df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0)
+
+    df["VOL_MA20"] = df["volumeto"].rolling(20).mean()
+    return df
+
+def calculate_correlation(df: pd.DataFrame, btc_df: pd.DataFrame) -> float:
+    if btc_df is None or df is None: return 0.0
+    try:
+        aligned = df["close"].align(btc_df["close"], join="inner")
+        if len(aligned[0]) < 2: return 0.0
+        return round(aligned[0].corr(aligned[1]), 2)
+    except:
+        return 0.0
+
+def estimate_price_for_target_rsi(df: pd.DataFrame, target_rsi: float = 70.0, period: int = RSI_PERIOD) -> float | None:
+    """ประมาณราคาที่ RSI จะขยับไปแตะ target_rsi
+    [FIX] เดิมถ้า RSI ปัจจุบันสูง/เกินกว่าเป้าหมายอยู่แล้ว สูตรจะ clamp required_gain เป็น 0
+    แล้วคืนค่าราคาปัจจุบันเฉยๆ ทำให้ข้อความแสดงผลดูเหมือนเป้าหมาย = ราคาวันนี้ (สื่อความหมายผิด)
+    จึงเปลี่ยนเป็นคืนค่า None แทน เพื่อให้ผู้เรียกใช้แสดงข้อความ "ถึง/ใกล้เป้าหมายแล้ว" ได้ถูกต้อง"""
+    if len(df) < period + 1: return None
+    close = df["close"]
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean().iloc[-1]
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean().iloc[-1]
+    curr_price = close.iloc[-1]
+
+    # คำนวณ RSI ปัจจุบันเพื่อเช็คว่าถึงเป้าหมายอยู่แล้วหรือยัง
+    if avg_loss == 0:
+        curr_rsi = 100.0
+    else:
+        curr_rs = avg_gain / avg_loss
+        curr_rsi = 100 - (100 / (1 + curr_rs))
+
+    if target_rsi >= 100: return curr_price * 1.5
+    if target_rsi <= 0: return curr_price * 0.5
+
+    if target_rsi > 50 and curr_rsi >= target_rsi: return None
+    if target_rsi <= 50 and curr_rsi <= target_rsi: return None
+
+    target_rs = target_rsi / (100.0 - target_rsi)
+    
+    if target_rsi > 50:
+        next_avg_loss = (avg_loss * (period - 1)) / period
+        required_avg_gain = target_rs * next_avg_loss
+        required_gain = max(0, (required_avg_gain * period) - (avg_gain * (period - 1)))
+        return curr_price + required_gain
+    else:
+        next_avg_gain = (avg_gain * (period - 1)) / period
+        required_avg_loss = next_avg_gain / target_rs
+        required_loss = max(0, (required_avg_loss * period) - (avg_loss * (period - 1)))
+        return curr_price - required_loss
+
+def find_fair_value_gaps(df: pd.DataFrame) -> dict:
+    fvg_result = {"has_fvg_support": False, "fvg_top": None, "fvg_bottom": None}
+    if len(df) < 4: return fvg_result
+    for i in range(len(df) - 1, 2, -1):
+        high_minus2, low_current = df["high"].iloc[i - 2], df["low"].iloc[i]
+        close_minus1, open_minus1 = df["close"].iloc[i - 1], df["open"].iloc[i - 1]
+        
+        if low_current > high_minus2 and close_minus1 > open_minus1:
+            gap_pct = ((low_current - high_minus2) / high_minus2) * 100
+            if gap_pct >= FVG_THRESHOLD_PCT:
+                curr_price = df["close"].iloc[-1]
+                if curr_price > high_minus2:
+                    fvg_result.update({"has_fvg_support": True, "fvg_top": low_current, "fvg_bottom": high_minus2})
+                    break
+    return fvg_result
+
+def analyze_trend_continuity(df: pd.DataFrame) -> dict:
+    result = {
+        "ema50_slope_pct": 0.0, "ema200_slope_pct": 0.0,
+        "ema50_trending_up": False, "ema200_trending_up": False,
+        "consecutive_up": 0, "consecutive_down": 0,
+        "trend_strength": "sideways", "trend_label": "↔️ โมเมนตัมระยะสั้น: ไม่ชัดเจน",
+    }
+    n = TREND_SLOPE_BARS
+    if len(df) < n + 2: return result
+
+    ema50_now, ema50_prev = df["EMA_50"].iloc[-1], df["EMA_50"].iloc[-(n + 1)]
+    ema200_now, ema200_prev = df["EMA_200"].iloc[-1], df["EMA_200"].iloc[-(n + 1)]
+
+    slope50  = ((ema50_now  - ema50_prev)  / ema50_prev)  * 100 if ema50_prev  != 0 else 0
+    slope200 = ((ema200_now - ema200_prev) / ema200_prev) * 100 if ema200_prev != 0 else 0
+
+    result.update({
+        "ema50_slope_pct": round(slope50, 4), "ema200_slope_pct": round(slope200, 4),
+        "ema50_trending_up": slope50 > 0, "ema200_trending_up": slope200 > 0
+    })
+
+    closes = df["close"].iloc[-20:]
+    diffs  = closes.diff().iloc[1:]
+    up_streak, dn_streak = 0, 0
+    for val in reversed(diffs.values):
+        if val > 0:
+            if dn_streak == 0: up_streak += 1
+            else: break
+        elif val < 0:
+            if up_streak == 0: dn_streak += 1
+            else: break
+        else: break
+
+    result.update({"consecutive_up": up_streak, "consecutive_down": dn_streak})
+    both_up, both_down = (slope50 > 0 and slope200 > 0), (slope50 <= 0 and slope200 <= 0)
+
+    if both_up and up_streak >= TREND_MIN_CONSECUTIVE: strength, label = "strong_up", f"🚀 โมเมนตัมระยะสั้นขึ้นต่อเนื่องแข็งแกร่ง ({up_streak} แท่ง, EMA ชันขึ้นทั้งคู่)"
+    elif slope50 > 0 and up_streak >= 1: strength, label = "moderate_up", f"📈 โมเมนตัมระยะสั้นขึ้นปานกลาง ({up_streak} แท่ง, EMA50 ชันขึ้น)"
+    elif both_down and dn_streak >= TREND_MIN_CONSECUTIVE: strength, label = "strong_down", f"🔻 โมเมนตัมระยะสั้นลงต่อเนื่องแข็งแกร่ง ({dn_streak} แท่ง, EMA ชันลงทั้งคู่)"
+    elif slope50 <= 0 and dn_streak >= 1: strength, label = "moderate_down", f"📉 โมเมนตัมระยะสั้นลงปานกลาง ({dn_streak} แท่ง, EMA50 ชันลง)"
+    else: strength, label = "sideways", "↔️ โมเมนตัมระยะสั้น Sideways / แนวโน้มไม่ชัด"
+
+    result.update({"trend_strength": strength, "trend_label": label})
+    return result
+
+def analyze_rsi_bounce(df: pd.DataFrame) -> dict:
+    window = LOOKBACK_BARS
+    result = {"touched_oversold": False, "rsi_low": None, "rsi_rise": 0.0, "consecutive_rise": 0, "below_midline": False, "quality": "none", "quality_label": "⬜ ไม่มีสัญญาณดีดกลับ", "entry_timing": ""}
+    if len(df) < window + RSI_BOUNCE_CONFIRM_BARS + 2: return result
+
+    rsi_series, rsi_curr = df["RSI"].iloc[-(window + 1):-1], df["RSI"].iloc[-1]
+    rsi_min = rsi_series.min()
+    touched_oversold = rsi_min <= RSI_OVERSOLD
+    result.update({"touched_oversold": touched_oversold, "rsi_low": round(rsi_min, 2)})
+
+    if not touched_oversold: return result
+
+    rsi_rise = rsi_curr - rsi_min
+    result["rsi_rise"] = round(rsi_rise, 2)
+
+    recent_rsi = df["RSI"].iloc[-(RSI_BOUNCE_CONFIRM_BARS + 3):]
+    rsi_diffs  = recent_rsi.diff().iloc[1:]
+    consec = sum(1 for val in reversed(rsi_diffs.values) if val > 0)
+    
+    result.update({"consecutive_rise": consec, "below_midline": rsi_curr < 50})
+    has_recovered = (df["RSI"].iloc[-RSI_RECOVERY_LOOKBACK:] >= RSI_RECOVERY_THRESHOLD).any()
+
+    score = sum([rsi_rise >= RSI_BOUNCE_MIN_RISE, consec >= RSI_BOUNCE_CONFIRM_BARS, rsi_curr < 50 or has_recovered])
+
+    if score == 3: quality, label, timing = "strong", f"✅ ดีดกลับแข็งแกร่ง (ต่ำสุด {rsi_min:.1f} → ขึ้น {rsi_rise:.1f} จุด)", "⭐ จังหวะเข้าซื้อดีที่สุด"
+    elif score == 2: quality, label, timing = "moderate", f"🟡 ดีดกลับปานกลาง (ต่ำสุด {rsi_min:.1f} → ขึ้น {rsi_rise:.1f} จุด)", "⚡ พิจารณาเข้าซื้อได้"
+    elif score == 1: quality, label, timing = "weak", f"🟠 ดีดกลับอ่อน (ขึ้น {rsi_rise:.1f} จุด)", "⚠️ ยังไม่แนะนำ: สัญญาณดีดกลับยังไม่ชัด"
+    else: quality, label, timing = "none", f"⬜ ยังไม่ดีดกลับ (ต่ำสุด {rsi_min:.1f})", "🚫 รอให้ RSI ดีดกลับก่อน"
+
+    result.update({"quality": quality, "quality_label": label, "entry_timing": timing})
+    return result
+
+def find_order_blocks(df: pd.DataFrame, lookback: int = OB_LOOKBACK) -> dict:
+    """ตรวจหาโซน Order Block (SMC) จากแท่ง Displacement (breakout แรงผิดปกติเทียบช่วงก่อนหน้า)
+    [FIX] เดิมเช็คเฉพาะว่า "แท่งปัจจุบัน" เป็นแท่ง breakout เท่านั้น ทำให้ has_bullish_ob เป็น True
+    ได้แค่ในวันเดียวกับ breakout - ขัดกับ in_ob_zone (ผู้เรียกใช้) ที่ต้องการให้ราคา "ย่อกลับมา"
+    ใกล้โซน OB ก่อนถึงจะนับเป็นจุดซื้อ ทั้งสองเงื่อนไขแทบไม่จริงพร้อมกันในแท่งเดียว
+    จึงเปลี่ยนมาไล่หาแท่ง Displacement ล่าสุดภายในหน้าต่าง lookback แทน ทำให้ OB ที่เพิ่งเกิดขึ้น
+    เมื่อหลายแท่งก่อนยังคงนับว่า "ใช้งานได้" จนกว่าราคาจะย่อกลับมาทดสอบจริง ตรงตามหลัก SMC มากขึ้น"""
+    ob_result = {"bullish_ob_price": None, "bearish_ob_price": None, "has_bullish_ob": False, "has_bearish_ob": False}
+    min_len = lookback + 30
+    if len(df) < min_len:
+        return ob_result
+
+    body_sizes = (df["close"] - df["open"]).abs()
+    avg_body = body_sizes.rolling(20).mean()
+    roll_high = df["high"].rolling(20).max().shift(1)   # high สูงสุดของ 20 แท่งก่อนแท่งนั้นๆ (ไม่รวมตัวเอง)
+    roll_low = df["low"].rolling(20).min().shift(1)      # low ต่ำสุดของ 20 แท่งก่อนแท่งนั้นๆ (ไม่รวมตัวเอง)
+
+    n = len(df)
+    for offset in range(1, lookback + 1):
+        d = n - offset  # ตำแหน่ง absolute ของแท่ง Displacement ที่กำลังตรวจ (ใหม่สุดก่อน)
+        if d < 21:
+            break
+        avg_body_d = avg_body.iloc[d]
+        rh, rl = roll_high.iloc[d], roll_low.iloc[d]
+        if pd.isna(avg_body_d) or avg_body_d == 0 or pd.isna(rh) or pd.isna(rl):
+            continue
+        disp_close, disp_open = df["close"].iloc[d], df["open"].iloc[d]
+        disp_body = abs(disp_close - disp_open)
+
+        # --- Bullish Displacement: แท่ง d ทะลุ high ของ 20 แท่งก่อนหน้าด้วยตัวแท่งใหญ่ผิดปกติ ---
+        if not ob_result["has_bullish_ob"] and disp_close > rh and disp_body > (avg_body_d * OB_IMBALANCE_RATIO):
+            for back in range(1, 16):
+                idx = d - back
+                if idx < 0:
+                    break
+                p_open, p_close, p_low = df["open"].iloc[idx], df["close"].iloc[idx], df["low"].iloc[idx]
+                violated = (df["low"].iloc[idx + 1 : d] < p_low).any()
+                if p_close < p_open and not violated:
+                    ob_result.update({"has_bullish_ob": True, "bullish_ob_price": p_low})
+                    break
+
+        # --- Bearish Displacement: แท่ง d ทะลุ low ของ 20 แท่งก่อนหน้าด้วยตัวแท่งใหญ่ผิดปกติ ---
+        if not ob_result["has_bearish_ob"] and disp_close < rl and disp_body > (avg_body_d * OB_IMBALANCE_RATIO):
+            for back in range(1, 16):
+                idx = d - back
+                if idx < 0:
+                    break
+                p_open, p_close, p_high = df["open"].iloc[idx], df["close"].iloc[idx], df["high"].iloc[idx]
+                violated = (df["high"].iloc[idx + 1 : d] > p_high).any()
+                if p_close > p_open and not violated:
+                    ob_result.update({"has_bearish_ob": True, "bearish_ob_price": p_high})
+                    break
+
+        if ob_result["has_bullish_ob"] and ob_result["has_bearish_ob"]:
+            break
+
+    return ob_result
+
+def check_bullish_divergence(df: pd.DataFrame) -> bool:
+    if len(df) < LOOKBACK_BARS + 2: return False
+    prev_window = df.iloc[-(LOOKBACK_BARS + 1) : -(LOOKBACK_SKIP_BARS)]
+    if len(prev_window) == 0: return False
+        
+    min_low_idx = prev_window["low"].argmin()
+    prev_low_price, prev_low_rsi = prev_window["low"].iloc[min_low_idx], prev_window["RSI"].iloc[min_low_idx]
+
+    if prev_low_rsi > RSI_BULL_DIV_MAX: return False
+    return (df["low"].iloc[-1] < prev_low_price) and (df["RSI"].iloc[-1] > prev_low_rsi)
+
+def check_bearish_divergence(df: pd.DataFrame) -> bool:
+    """Bearish Divergence: ราคาทำ High ใหม่สูงกว่าเดิม แต่ RSI กลับทำ High ต่ำกว่าเดิม
+    (โมเมนตัมอ่อนแรงสวนทางราคา - สัญญาณเตือนความเสี่ยงพักฐาน/กลับตัว)"""
+    if len(df) < LOOKBACK_BARS + 2: return False
+    prev_window = df.iloc[-(LOOKBACK_BARS + 1) : -(LOOKBACK_SKIP_BARS)]
+    if len(prev_window) == 0: return False
+
+    max_high_idx = prev_window["high"].argmax()
+    prev_high_price, prev_high_rsi = prev_window["high"].iloc[max_high_idx], prev_window["RSI"].iloc[max_high_idx]
+
+    if prev_high_rsi < RSI_BEAR_DIV_MIN: return False
+    return (df["high"].iloc[-1] > prev_high_price) and (df["RSI"].iloc[-1] < prev_high_rsi)
+
+def is_volume_confirmed(row: pd.Series) -> bool:
+    if pd.isna(row.get("VOL_MA20")) or row["VOL_MA20"] == 0: return False
+    return row["volumeto"] > row["VOL_MA20"]
+
+def format_price(price: float) -> str:
+    if price is None: return "N/A"
+    if price < 0.0001: return f"{price:.8f}"
+    elif price < 0.001: return f"{price:.6f}"
+    elif price < 1: return f"{price:.4f}"
+    else: return f"{price:.2f}"
+
+# ==========================================
+# Market Scanner with Multi-Timeframe Filter & Bulk optimization
+# ==========================================
+def scan_market():
+    buy_signals, sell_signals = [], []
+    bullish_coins, bearish_coins, total_valid_coins = 0, 0, 0
+    coin_trends_summary = []
+
+    # --- 1. Fetch Baseline Market Data (BTC) ---
+    logger.info("รอให้ระบบ VPN ตั้งไข่ให้เสถียร (5 วินาที)...")
+    time.sleep(5) 
+
+    logger.info("ดึงข้อมูลดัชนีตลาดล่วงหน้า (BTC) จาก Binance เพื่อวิเคราะห์ Regime & Correlation...")
+    try:
+        btc_df = get_historical_data("BTC")
+    except BinanceBlockedError:
+        # [FIX VPN] Pre-flight check: ถ้า Binance บล็อกตั้งแต่ดึง BTC แท่งแรก
+        # แปลว่า VPN tunnel รอบนี้ใช้ไม่ได้จริง ไม่มีประโยชน์ที่จะไล่สแกนอีก 15 เหรียญ (~30 requests)
+        # ให้แจ้งเตือนและจบรอบทันที พร้อมทำให้ GitHub Actions job ขึ้นสถานะ failed
+        # เพื่อใช้นับความถี่ของปัญหา VPN ย้อนหลังได้จากแท็บ Actions
+        logger.error("❌ Binance บล็อก IP ตั้งแต่จุดแรก (BTC) - VPN tunnel ใช้ไม่ได้ในรอบนี้ ยกเลิกการสแกนทันที")
+        send_telegram_messages([
+            "⚠️ <b>ข้าม Cycle นี้</b>: VPN เชื่อมต่อสำเร็จในระดับเครือข่าย แต่ Binance ยังบล็อก IP อยู่ (HTTP 451)\n"
+            "สาเหตุที่เป็นไปได้: เซิร์ฟเวอร์ VPNGate ตัวนี้ถูกขึ้นบัญชีดำแล้ว\n"
+            "ระบบจะลองใหม่อัตโนมัติในรอบถัดไป"
+        ])
+        sys.exit(1)
+    market_regime = "Unknown ⚪"
+    if btc_df is not None:
+        btc_df = calculate_indicators(btc_df)
+        btc_price = btc_df["close"].iloc[-1]
+        btc_ema200 = btc_df["EMA_200"].iloc[-1]
+        market_regime = "Bull Market 🟢" if btc_price > btc_ema200 else "Bear Market 🔴"
+
+    # --- 2. Optimization 3: Bulk Fetch Binance Funding Rate ---
+    logger.info("ดึงข้อมูล Bulk Funding Rate ยักษ์ใหญ่จากหน้าตลาดรวมฟิวเจอร์ส...")
+    funding_map = {}
+    try:
+        pi_url = f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex"
+        pi_resp = api_session.get(pi_url, timeout=10)
+        if pi_resp.status_code == 200:
+            pi_data = pi_resp.json()
+            if isinstance(pi_data, list):
+                for item in pi_data:
+                    if "symbol" in item and "lastFundingRate" in item:
+                        funding_map[item["symbol"]] = float(item["lastFundingRate"])
+    except Exception as e:
+        logger.warning(f"ไม่สามารถดึงข้อมูล Premium Index ภาพรวมได้: {e}")
+
+    # --- 3. Scan All Coins ---
+    vpn_blocked_mid_scan = False
+    for coin in COINS:
+        logger.info(f"กำลังสแกนโครงสร้างหลักเหรียญ: {coin} (Binance API Direct Mode)...")
+        
+        # --- Optimization 2: ดึงข้อมูลโครงสร้างวันเดียว แจกต่อฟังก์ชันย่อย ---
+        try:
+            df_daily = get_histoday_data(coin)
+        except BinanceBlockedError:
+            # [FIX VPN] VPN หลุดกลางคัน - หยุดสแกนเหรียญที่เหลือทันที ไม่ไล่ยิง request เปล่าประโยชน์ต่อ
+            logger.error(f"❌ Binance บล็อก IP ขณะสแกน {coin} (1D) - หยุดสแกนเหรียญที่เหลือ ({total_valid_coins} เหรียญผ่านไปแล้ว)")
+            vpn_blocked_mid_scan = True
+            break
+        time.sleep(API_RATE_LIMIT_DELAY)
+        
+        if df_daily is not None:
+            df_daily = calculate_indicators(df_daily)
+            weekly_ctx = analyze_weekly_context(df_daily)
+            monthly_ctx = analyze_monthly_targets(df_daily)
+            cycle_ctx = analyze_cycle_targets(df_daily)
+            death_cross_ctx = check_death_cross_1d(df_daily)
+        else:
+            # Fallbacks ถ้าข้อมูลขาดหาย
+            weekly_ctx = {"rsi_weekly": None, "weekly_bullish_div": False, "weekly_status_label": "↔️ ไม่พบข้อมูลระบุระดับสัปดาห์ชัดเจน", "fibo_618": None, "fibo_786": None, "fibo_886": None, "liquidity_pool": None, "psycho_support": None}
+            monthly_ctx = {"m_resistance_target": None, "m_support_target": None, "monthly_summary_label": "⏳ ไม่สามารถคำนวณเป้าหมายระดับเดือนได้", "monthly_trend": "sideways"}
+            cycle_ctx = {"cycle_target_zone": None, "cycle_confluence_factors": [], "cycle_summary_label": "⏳ ไม่สามารถวิเคราะห์เป้าหมายไซเคิลได้"}
+            death_cross_ctx = {"has_death_cross": False, "death_cross_label": "⚪ 1D Death Cross: ปลอดภัย (ยังไม่เกิดการตัดลง)"}
+
+        # ดึง 4H แท่งประมวลผลหลัก
+        try:
+            df = get_historical_data(coin)
+        except BinanceBlockedError:
+            logger.error(f"❌ Binance บล็อก IP ขณะสแกน {coin} (4H) - หยุดสแกนเหรียญที่เหลือ ({total_valid_coins} เหรียญผ่านไปแล้ว)")
+            vpn_blocked_mid_scan = True
+            break
+        time.sleep(API_RATE_LIMIT_DELAY)
+
+        if df is None or len(df) < EMA_LONG + 10:
+            logger.warning(f"{coin}: ข้อมูลแท่งเทียนตลาดจำลองไม่เพียงพอคำนวณอินดิเคเตอร์ – ข้าม")
+            continue
+
+        onchain_ctx = analyze_onchain_momentum(coin) 
+        
+        # ค้นหาค่าและประกอบข้อมูลฟิวเจอร์สจากชุดข้อมูล Bulk ตามชื่อเหรียญที่ถูกแมป
+        symbol_futures = get_futures_symbol(coin)
+        current_fr = funding_map.get(symbol_futures, None)
+        futures_ctx = analyze_futures_context(coin, current_fr)
+        time.sleep(API_RATE_LIMIT_DELAY) 
+        
+        df = calculate_indicators(df)
+        row = df.iloc[-1]
+
+        current_price = row["close"]
+        rsi = row["RSI"]
+        ema_50 = row["EMA_50"]
+        ema_200 = row["EMA_200"]
+        atr = row["ATR"]
+        adx = row["ADX"]
+        vol_confirmed = is_volume_confirmed(row)
+        
+        corr_btc = calculate_correlation(df, btc_df) if coin != "BTC" else 1.0
+        squeeze_warning = adx < 20
+        trailing_stop_val = current_price - (atr * ATR_MULTIPLIER)
+
+        total_valid_coins += 1
+        is_divergence = check_bullish_divergence(df)
+        is_bear_divergence = check_bearish_divergence(df)
+        rsi_rounded = round(rsi, 2)
+
+        trend_info = analyze_trend_continuity(df)
+        bounce_info = analyze_rsi_bounce(df)
+        ob_info = find_order_blocks(df)
+        fvg_info = find_fair_value_gaps(df)
+
+        dynamic_tp_ob = estimate_price_for_target_rsi(df, target_rsi=70.0)
+
+        fibo_4h_max = df["high"].iloc[-60:].max()
+        fibo_4h_min = df["low"].iloc[-60:].min()
+        fibo_4h_618 = fibo_4h_max - (0.618 * (fibo_4h_max - fibo_4h_min))
+
+        tier = COIN_TIER.get(coin, "mid")
+        tp1_pct = TP_TIERS[tier]["tp1"]
+        tp2_pct = TP_TIERS[tier]["tp2"]
+        sl_buf = TP_TIERS[tier]["sl_buffer"]
+        vol_tag = " 🔊" if vol_confirmed else ""
+
+        # in_fibo_zone = โซน Fibo 61.8% (ย่อตื้น) ส่วน in_deep_support ด้านล่างคือโซนลึกจริง (78.6%/88.6%/Liquidity/Psycho)
+        # ไม่ใช่โซนเดียวกัน แม้ทั้งคู่จะถูกใช้เป็นเงื่อนไขเข้าซื้อก็ตาม
+        in_fibo_zone = (weekly_ctx["fibo_618"] is not None) and (current_price <= weekly_ctx["fibo_618"] * 1.02)
+        in_4h_fibo_zone = current_price <= (fibo_4h_618 * 1.01)
+        in_ob_zone = ob_info["has_bullish_ob"] and (current_price <= ob_info["bullish_ob_price"] * 1.03)
+        in_fvg_zone = fvg_info["has_fvg_support"] and (current_price <= fvg_info["fvg_top"]) and (current_price >= fvg_info["fvg_bottom"] * 0.99)
+        # [FIX] เพิ่ม proximity check ให้ Bearish OB เหมือน in_ob_zone ฝั่งซื้อ - เดิม sell trigger เช็คแค่
+        # "เคยมี OB เกิดขึ้นในช่วง lookback 20 แท่ง" โดยไม่สนระยะห่างจากราคาปัจจุบันเลย ทำให้เหรียญที่ราคาวิ่ง
+        # หลุดออกจากโซนนั้นไปไกลแล้วยังโดนเตือน "ใกล้แนวต้าน" อยู่ ทั้งที่ RSI อาจต่ำลงมากแล้วก็ตาม
+        in_bearish_ob_zone = ob_info["has_bearish_ob"] and (current_price >= ob_info["bearish_ob_price"] * 0.97)
+
+        in_deep_support = False
+        if weekly_ctx.get("fibo_786") is not None:
+            if (current_price <= weekly_ctx["fibo_786"] * 1.02) or \
+               (weekly_ctx.get("liquidity_pool") and current_price <= weekly_ctx["liquidity_pool"] * 1.05) or \
+               (weekly_ctx.get("psycho_support") and current_price <= weekly_ctx["psycho_support"] * 1.02):
+                in_deep_support = True
+
+        signal_type = ""
+
+        if current_price > ema_200:
+            coin_trend = "🟢 ขาขึ้นระยะยาว (ราคาอยู่เหนือ EMA200)"
+            bullish_coins += 1
+            coin_trends_summary.append(f"• {coin}: 🟢 ขาขึ้น (RSI 4H: {rsi_rounded}) | {trend_info['trend_label']}")
+
+            if in_fibo_zone or in_4h_fibo_zone or in_ob_zone or in_fvg_zone:
+                # [FIX] Removed redundant rsi <= RSI_OVERSOLD logic
+                if current_price > (ema_50 * 0.98) and (rsi <= RSI_PULLBACK_THRESHOLD):
+                    # [FIX] Changed "&" to "and" to prevent Telegram HTML parsing error
+                    if bounce_info["quality"] in ["strong", "moderate"]: signal_type = f"Institution Dip and Rebound 📉{vol_tag}"
+                    elif rsi <= RSI_OVERSOLD: signal_type = f"Golden Fib / OB Zone Oversold 📉{vol_tag}"
+
+                # [FIX] เติมเพดาน rsi < RSI_OVERBOUGHT กันสัญญาณซื้อชนกับ RSI overbought แล้วโดน elif
+                # ของฝั่งขายบังจนไม่มีการเตือน overbought เลยในบางกรณี
+                if is_divergence and not signal_type and rsi < RSI_OVERBOUGHT: signal_type = f"Confluence Bullish Divergence 📈{vol_tag}"
+                # [FIX] เปลี่ยนจาก has_bullish_ob (เคยมี OB เกิดขึ้นที่ไหนก็ได้ใน 20 แท่ง) เป็น in_ob_zone
+                # (ราคาต้องอยู่ใกล้ระดับ OB จริงๆ ไม่เกิน 3%) เพราะเดิมเหรียญที่เข้าเงื่อนไขผ่านโซนอื่น
+                # (เช่น in_fibo_zone) แต่ OB ที่เจออยู่ห่างราคาปัจจุบันไปไกลแล้ว ก็ยังโดนติด Label "OB Reversal"
+                # ทั้งที่ไม่ได้กำลังเทสโซนนั้นจริง ทำให้ RSI สูงเกินกว่าจะเรียกว่า "ช้อนซื้อ" หลุดเข้ามาได้
+                if in_ob_zone and not signal_type and rsi < RSI_OVERBOUGHT: signal_type = f"Smart Money OB Reversal 🚀{vol_tag}"
+
+        else:
+            coin_trend = "🔴 ขาลงระยะยาว (ราคาอยู่ใต้ EMA200)"
+            bearish_coins += 1
+            coin_trends_summary.append(f"• {coin}: 🔴 ขาลง (RSI 4H: {rsi_rounded}) | {trend_info['trend_label']}")
+
+            if in_deep_support and is_divergence: signal_type = f"🚨 DEEP REVERSAL (Liquidity/Fibo 78.6-88.6) + Bullish Div 🐳{vol_tag}"
+            elif in_deep_support and bounce_info["quality"] == "strong": signal_type = f"🛡️ Deep Support Strong Bounce (รอคอนเฟิร์มเทรนด์) 📉{vol_tag}"
+            elif in_fibo_zone or in_ob_zone:
+                if rsi <= RSI_OVERSOLD: signal_type = f"Fib 61.8% สวนเทรนด์ขาลง (เสี่ยงสูง) 📉{vol_tag}"
+                elif is_divergence: signal_type = f"Macro Support Divergence (สวนเทรนด์) 📈{vol_tag}"
+
+        # [FIX] Mutually Exclusive Logic: Check Buy condition first.
+        if signal_type:
+            if onchain_ctx.get("onchain_warning"):
+                signal_type = f"⚠️ ปัจจัย On-Chain เสี่ยงสูง + {signal_type}"
+
+            if weekly_ctx.get("weekly_bullish_div"): signal_type = f"⭐ {signal_type} + [1W Bullish Divergence แม่นยำสูง]"
+            elif weekly_ctx.get("rsi_weekly") and weekly_ctx["rsi_weekly"] <= 35: signal_type = f"💎 {signal_type} + [1W คอนเฟิร์มโซนก้นหลุมสัปดาห์]"
+            elif monthly_ctx.get("monthly_trend") == "bullish" and in_fvg_zone: signal_type = f"🔥 {signal_type} + [1M มหาเทรนด์หนุน + FVG เติมเต็ม]"
+
+            entry_min = format_price(current_price * 0.98)
+            entry_max = format_price(current_price * 1.01)
+            target_tp1 = current_price * (1 + tp1_pct)
+            target_tp2 = current_price * (1 + tp2_pct)
+            
+            sl_reference = ema_200
+            if in_deep_support and weekly_ctx.get("fibo_886"): sl_reference = weekly_ctx["fibo_886"]
+            elif ob_info["has_bullish_ob"]: sl_reference = ob_info["bullish_ob_price"]
+            elif fvg_info["has_fvg_support"]: sl_reference = fvg_info["fvg_bottom"]
+            
+            sl_val = sl_reference * (1 - sl_buf) if current_price > sl_reference else current_price * (1 - sl_buf)
+            
+            # --- Position Sizing Calculation ---
+            sl_distance_pct = (current_price - sl_val) / current_price
+            if sl_distance_pct <= 0: sl_distance_pct = 0.01 
+            risk_amount_usdt = PORTFOLIO_USDT * (RISK_PER_TRADE_PCT / 100)
+            position_size_usdt = risk_amount_usdt / sl_distance_pct
+            position_size_usdt = min(position_size_usdt, PORTFOLIO_USDT) 
+
+            # [FIX] ถ้า RSI ถึง/เกินเป้าหมาย 70 อยู่แล้ว estimate_price_for_target_rsi จะคืน None
+            # แสดงข้อความอธิบายแทนที่จะโชว์ "$N/A" ที่สื่อความหมายไม่ชัด
+            dynamic_tp_text = f"${format_price(dynamic_tp_ob)}" if dynamic_tp_ob is not None else "🎯 RSI ใกล้โซน Overbought แล้ว (ไม่มีเป้าหมายขยับต่อ)"
+
+            buy_signals.append({
+                "coin": coin, "trend": coin_trend, "price": format_price(current_price), "rsi": rsi_rounded,
+                "type": signal_type, "ema_50": format_price(ema_50), "ema_200": format_price(ema_200),
+                "entry": f"${entry_min} - ${entry_max}",
+                "tp1": f"${format_price(target_tp1)} (+{tp1_pct*100:.0f}%)",
+                "tp2": f"${format_price(target_tp2)} (+{tp2_pct*100:.0f}%)",
+                "dynamic_tp": dynamic_tp_text,
+                "trailing_stop": f"${format_price(max(trailing_stop_val, sl_val))}",
+                "sl": f"${format_price(sl_val)}",
+                "vol_confirmed": vol_confirmed,
+                "trend_info": trend_info, "bounce_info": bounce_info, "ob_info": ob_info, "fvg_info": fvg_info,
+                "weekly_ctx": weekly_ctx, "monthly_ctx": monthly_ctx, "cycle_ctx": cycle_ctx, "onchain_ctx": onchain_ctx,
+                "death_cross_ctx": death_cross_ctx, 
+                "futures_ctx": futures_ctx,         
+                "corr_btc": corr_btc, "squeeze_warning": squeeze_warning, "adx": round(adx, 2),
+                "pos_size": f"${position_size_usdt:.2f}", "sl_risk_pct": f"{sl_distance_pct*100:.1f}%"
+            })
+
+        # [FIX Bug 1 & 2] Sell signal: ตรวจสอบเงื่อนไขให้ครบถ้วนและแสดง TP Zone ที่สื่อความหมายถูกต้อง
+        # TP zone ควรแสดงช่วงราคาทำกำไรจากตำแหน่งที่ถือไว้ก่อนหน้า ไม่ใช่จากราคาปัจจุบัน
+        # [FIX] เพิ่ม is_bear_divergence เป็นอีกหนึ่งเงื่อนไขเตือนขาย (เดิมประกาศ RSI_BEAR_DIV_MIN ไว้แต่ไม่เคยถูกใช้งานจริง)
+        elif rsi >= RSI_OVERBOUGHT or is_bear_divergence or in_bearish_ob_zone:
+            # แสดงโซนระวัง: ราคาที่ควรทยอยขายทำกำไร (ต่ำกว่าปัจจุบันลงมา เพื่อล็อกกำไร)
+            tp_min = format_price(current_price * (1 - tp1_pct * 0.4))
+            tp_max = format_price(current_price * 1.00)
+            exit_val = ema_50 if current_price > ema_50 else current_price * (1 - sl_buf)
+
+            # [FIX] ระบุสาเหตุที่ติดเตือนให้ชัดเจนในข้อความ เพราะเงื่อนไขมี 3 ทางที่เป็นอิสระจากกัน
+            # (RSI overbought / Bearish Divergence / ใกล้โซน Bearish OB) ถ้าไม่บอกสาเหตุ ผู้ใช้จะเข้าใจผิด
+            # ว่าเป็นการเตือนจาก RSI สูงเสมอ ทั้งที่บางครั้ง RSI อาจกลางๆ หรือต่ำก็ได้ถ้าเหตุผลคือ OB/Divergence
+            trigger_reasons = []
+            if rsi >= RSI_OVERBOUGHT:
+                trigger_reasons.append(f"RSI เข้าเขต Overbought ({rsi_rounded})")
+            if is_bear_divergence:
+                trigger_reasons.append("เกิด Bearish Divergence (ราคาทำ High ใหม่ แต่ RSI อ่อนแรงกว่าเดิม)")
+            if in_bearish_ob_zone:
+                trigger_reasons.append(f"ราคาเข้าใกล้แนวต้าน Smart Money OB (${format_price(ob_info['bearish_ob_price'])})")
+            trigger_reason_text = " + ".join(trigger_reasons)
+
+            sell_signals.append({
+                "coin": coin, "trend": coin_trend, "price": format_price(current_price), "rsi": rsi_rounded,
+                "tp_zone": f"${tp_min} - ${tp_max}", "exit": f"${format_price(exit_val)}",
+                "vol_confirmed": vol_confirmed, "trend_info": trend_info, "ob_info": ob_info,
+                "weekly_ctx": weekly_ctx, "cycle_ctx": cycle_ctx, "bear_divergence": is_bear_divergence,
+                "trigger_reason": trigger_reason_text
+            })
+
+    if total_valid_coins > 0:
+        bullish_ratio = (bullish_coins / total_valid_coins) * 100
+        summary_msg = f"📊 <b>[Market & Portfolio Summary - Binance Native]</b>\n"
+        if vpn_blocked_mid_scan:
+            summary_msg += f"⚠️ <b>หมายเหตุ:</b> VPN หลุดกลางคัน สแกนได้เพียง {total_valid_coins}/{len(COINS)} เหรียญในรอบนี้\n"
+        summary_msg += f"ทิศทางดัชนีหลักฟิวเจอร์ส (BTC): <b>{market_regime}</b>\n"
+        summary_msg += f"ทุนระบบตั้งต้น: {PORTFOLIO_USDT} USDT (Risk {RISK_PER_TRADE_PCT}%/ไม้)\n"
+        summary_msg += f"📈 ขาขึ้น: {bullish_coins} เหรียญ | 📉 ขาลง: {bearish_coins} เหรียญ\n"
+
+        if bullish_ratio >= 65: summary_msg += "🔥 ภาพรวม: <b>🟢 ขาขึ้นชัดเจน (Strong Bullish)</b>\n<i>กลยุทธ์: ดักย่อซื้อเฉพาะจุดร่วมแนวรับระดับสถาบัน (Confluence Zone)</i>"
+        elif bullish_ratio >= 40: summary_msg += "🔥 ภาพรวม: <b>🟡 ไซด์เวย์ / เลือกทาง (Sideways)</b>\n<i>กลยุทธ์: ตลาดก้ำกึ่ง ควรรอราคาลงสู้กรอบล่าง Fibonacci 61.8%</i>"
+        else: summary_msg += "🔥 ภาพรวม: <b>🔴 ขาลง / พักฐานแรง (Bearish)</b>\n<i>กลยุทธ์: ตลาดเสี่ยงสูงมาก หลีกเลี่ยงสัญญาณทั่วไป ยกเว้นแนวรับทองคำ 1W</i>"
+
+        summary_msg += "\n\n📋 <b>สรุปแนวโน้มรายเหรียญ:</b>\n" + "\n".join(coin_trends_summary)
+    else:
+        if vpn_blocked_mid_scan:
+            summary_msg = "⚠️ VPN หลุดตั้งแต่เหรียญแรกของลูปสแกน ไม่สามารถดึงข้อมูลเหรียญใดได้เลยในรอบนี้"
+        else:
+            summary_msg = "⚠️ ไม่สามารถดึงข้อมูลเหรียญเพื่อวิเคราะห์ภาพรวมได้"
+
+    return buy_signals, sell_signals, summary_msg
+
+# ==========================================
+# Message Builder with Confluence Alerts
+# ==========================================
+def build_messages(buy_list: list, sell_list: list, market_summary: str) -> list:
+    message_blocks = [market_summary]
+
+    if buy_list:
+        buy_header = "🎯 <b>[Crypto Screener 4H - สัญญาณช้อนซื้อจุดแนวรับสำคัญ]</b>"
+        current_block = buy_header
+
+        for opt in buy_list:
+            vol_note = "\n🔊 Volume: <b>ยืนยันสัญญาณ (สูงกว่า MA20)</b>" if opt["vol_confirmed"] else "\n🔇 Volume: ไม่ยืนยัน"
+            
+            corr_alert = f"\n⚠️ <b>Correlation:</b> {opt['corr_btc']} (วิ่งตาม BTC สูงมาก ควรระวังการกระจายความเสี่ยง)" if opt.get('corr_btc', 0) > 0.85 and opt['coin'] != 'BTC' else ""
+            time_alert = f"\n⏳ <b>Time Decay Alert:</b> ADX ต่ำ ({opt.get('adx', 0)}) ตลาดไซด์เวย์ อาจต้องถือรอนาน" if opt.get('squeeze_warning') else ""
+
+            ti, bi, ob, fvg = opt["trend_info"], opt["bounce_info"], opt["ob_info"], opt["fvg_info"]
+            w_ctx, m_ctx, c_ctx = opt.get("weekly_ctx", {}), opt.get("monthly_ctx", {}), opt.get("cycle_ctx", {})
+            onchain_ctx = opt.get("onchain_ctx", {})
+            dc_ctx = opt.get("death_cross_ctx", {}) 
+            ft_ctx = opt.get("futures_ctx", {})     
+
+            confluence_report = "\n🛡️ <b>การทดสอบแนวรับสถาบัน:</b>"
+            if w_ctx and w_ctx.get("fibo_618"):
+                confluence_report += f"\n   🔹 Fibo 1W (61.8%): <code>${format_price(w_ctx['fibo_618'])}</code>"
+                confluence_report += f"\n   🔸 Fibo 1W (78.6%): <code>${format_price(w_ctx['fibo_786'])}</code>"
+                confluence_report += f"\n   🔻 <b>Deep Support (กรณีหลุด):</b>"
+                confluence_report += f"\n      - Fibo 88.6%: <code>${format_price(w_ctx.get('fibo_886'))}</code>"
+                confluence_report += f"\n      - Liquidity Pool: <code>${format_price(w_ctx.get('liquidity_pool'))}</code>"
+                confluence_report += f"\n      - Psycho Support: <code>${format_price(w_ctx.get('psycho_support'))}</code>"
+
+            if fvg.get("has_fvg_support"): confluence_report += f"\n   ⚡พบช่องว่าง FVG ยักษ์ (4H): <code>${format_price(fvg['fvg_bottom'])} - ${format_price(fvg['fvg_top'])}</code>"
+            if ob.get("has_bullish_ob"): confluence_report += f"\n   🐳 Smart Money OB Support: <code>${format_price(ob['bullish_ob_price'])}</code>"
+
+            trend_block = f"\n📐 <b>โมเมนตัมระยะสั้น (4H, 5 แท่งล่าสุด):</b> {ti['trend_label']}"
+            bounce_block = f"\n🔄 <b>RSI Bounce Check:</b> {bi['quality_label']}" + (f"\n   {bi['entry_timing']}" if bi["entry_timing"] else "")
+            weekly_block = f"\n🗓️ <b>ภาพรวมระดับสัปดาห์ (1W):</b> {w_ctx['weekly_status_label']}" if w_ctx and w_ctx.get("rsi_weekly") else ""
+            onchain_block = f"\n📊 <b>ข้อมูล On-Chain เชิงลึก:</b>\n   {onchain_ctx.get('onchain_label', '')}" if onchain_ctx else ""
+            death_cross_block = f"\n   {dc_ctx.get('death_cross_label', '')}" if dc_ctx and dc_ctx.get("has_death_cross") else ""
+            futures_block = f"\n   {ft_ctx.get('futures_label', '')}" if ft_ctx else ""
+            monthly_block = f"\n🔮 <b>กรอบเป้าหมาย (1M):</b>\n   🔼 โซนเป้าหมายขึ้น: <code>${format_price(m_ctx['m_resistance_target'])}</code>\n   🔽 แนวรับถัดไป: <code>${format_price(m_ctx['m_support_target'])}</code>" if m_ctx and m_ctx.get("m_resistance_target") else ""
+            cycle_block = f"\n{c_ctx['cycle_summary_label']}" if c_ctx and c_ctx.get("cycle_target_zone") else ""
+
+            coin_msg = (
+                f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
+                f"\n📊 เทรนด์ระยะยาว (เทียบ EMA200): {opt['trend']}"
+                f"\n🚨 รูปแบบ: <b>{opt['type']}</b>"
+                f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
+                f"\n📉 RSI (4H): {opt['rsi']}"
+                f"{vol_note}"
+                f"{corr_alert}"
+                f"{time_alert}"
+                f"{confluence_report}"
+                f"{trend_block}"
+                f"{bounce_block}"
+                f"{weekly_block}"
+                f"{onchain_block}"
+                f"{death_cross_block}" 
+                f"{futures_block}"     
+                f"{monthly_block}"
+                f"{cycle_block}"
+                f"\n\n🛡️ <b>[Risk Management]</b>"
+                f"\n💼 <b>แนะนำขนาดไม้ซื้อ (Position Size): <code>{opt['pos_size']}</code></b>"
+                f"\n📉 ระยะความเสี่ยง: {opt['sl_risk_pct']}"
+                f"\n❌ ตัดขาดทุนป้องกันภัย (Hard SL): <code>{opt['sl']}</code>"
+                f"\n\n🚀 <b>[Take Profit Strategy]</b>"
+                f"\nเป้าหมาย Fix (TP1): <code>{opt['tp1']}</code>"
+                f"\nเป้าหมาย Fix (TP2): <code>{opt['tp2']}</code>"
+                f"\n🔥 <b>เป้าหมาย Dynamic (RSI=70): <code>{opt['dynamic_tp']}</code></b>"
+                f"\n🔗 <b>จุดรันเทรนด์ (Trailing Stop): <code>{opt['trailing_stop']}</code></b>"
+            )
+
+            if len(current_block) + len(coin_msg) > 3500:
+                message_blocks.append(current_block)
+                current_block = buy_header + coin_msg
+            else:
+                current_block += coin_msg
+        message_blocks.append(current_block)
+
+    if sell_list:
+        sell_header = "⚠️ <b>[Crypto Screener 4H - เตือนโซนทำกำไร / แนวต้านยักษ์]</b>"
+        current_block = sell_header
+
+        for opt in sell_list:
+            vol_note = "\n🔊 Volume: <b>ยืนยันแรงซื้อ (ระวังเกิดการพักตัว)</b>" if opt["vol_confirmed"] else "\n🔇 Volume: ปกติ"
+            ti, ob = opt["trend_info"], opt["ob_info"]
+            w_ctx, c_ctx = opt.get("weekly_ctx", {}), opt.get("cycle_ctx", {})
+            
+            trend_block = f"\n📐 <b>โมเมนตัมระยะสั้น (4H, 5 แท่งล่าสุด):</b> {ti['trend_label']}"
+            ob_block = f"\n🚨 <b>Smart Money Bearish OB:</b> กำแพงขายสถาบันที่ ${format_price(ob['bearish_ob_price'])}" if ob.get("has_bearish_ob") else ""
+            bear_div_block = "\n📉 <b>Bearish Divergence:</b> ราคาทำ High ใหม่ แต่ RSI อ่อนแรงกว่าเดิม (โมเมนตัมขาขึ้นเริ่มหมด)" if opt.get("bear_divergence") else ""
+            weekly_block = f"\n🗓️ <b>ภาพรวมระดับสัปดาห์ (1W):</b> {w_ctx['weekly_status_label']}" if w_ctx and w_ctx.get("rsi_weekly") else ""
+            cycle_block = f"\n{c_ctx['cycle_summary_label']}" if c_ctx and c_ctx.get("cycle_target_zone") else ""
+
+            coin_msg = (
+                f"\n\n🪙 <b>เหรียญ: {opt['coin']}</b>"
+                f"\n📊 เทรนด์ระยะยาว (เทียบ EMA200): {opt['trend']}"
+                f"\n💵 ราคาปัจจุบัน: ${opt['price']}"
+                f"\n📈 RSI (4H): {opt['rsi']}"
+                f"\n🔍 <b>สาเหตุที่เตือน:</b> {opt.get('trigger_reason', '-')}"
+                f"{vol_note}"
+                f"{trend_block}"
+                f"{ob_block}"
+                f"{bear_div_block}"
+                f"{weekly_block}"
+                f"{cycle_block}"
+                f"\n🔴 ช่วงราคาทยอยขายทำกำไร: <code>{opt['tp_zone']}</code>"
+                f"\n❌ จุดล็อกกำไร (Safety Exit): <code>{opt['exit']}</code>"
+            )
+
+            if len(current_block) + len(coin_msg) > 3500:
+                message_blocks.append(current_block)
+                current_block = sell_header + coin_msg
+            else:
+                current_block += coin_msg
+        message_blocks.append(current_block)
+
+    if not buy_list and not sell_list:
+        message_blocks.append("\n=========================\n😴 <i>ตลาดนิ่ง: ไม่มีเหรียญย่อเข้าโซนแนวรับระดับสถาบันในรอบนี้</i>")
+
+    return message_blocks
+
+# ==========================================
+# Main Execution Block
+# ==========================================
+if __name__ == "__main__":
+    logger.info("เริ่มต้นใช้งาน Crypto Screener (Binance Futures Direct & VPN Tunneling Ready)...")
+
+    buy_list, sell_list, market_summary = scan_market()
+    logger.info(f"สแกนระบบเสร็จสมบูรณ์ → พบสัญญาณซื้อคุณภาพ: {len(buy_list)} ตัว | พบสัญญาณขาย: {len(sell_list)} ตัว")
+
+    final_messages = build_messages(buy_list, sell_list, market_summary)
+    send_telegram_messages(final_messages)
+
+    logger.info("บอททำงานและแจ้งเตือนผ่าน Telegram สำเร็จ!")
